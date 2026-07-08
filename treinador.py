@@ -5,6 +5,8 @@ import warnings
 import joblib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+from requests.adapters import HTTPAdapter
 import ccxt
 import pandas as pd
 import numpy as np
@@ -18,31 +20,37 @@ from config import Config
 from ta_indicators import add_custom_ta
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, 
     format='%(asctime)s - [TREINADOR] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logging.getLogger("hmmlearn").setLevel(logging.ERROR)
 
 class DummyHMM:
-    """Classe de segurança estrita para absorver falhas sem interromper o processamento em lote."""
     def predict(self, X):
         return np.zeros(len(X))
 
 class MotorTreinamento:
     def __init__(self):
-        # Conexão estável síncrona focada no mercado de swaps perpétuos lineares
-        self.exchange = ccxt.bybit({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        })
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+
+        opcoes_ccxt = {
+            'enableRateLimit': True, 
+            'options': {'defaultType': 'swap'},
+            'session': session
+        }
+            
+        self.exchange = ccxt.bybit(opcoes_ccxt)
         self.btc_train_cache = []
         self.btc_train_time = 0
 
     def get_btc_data_sync(self):
         ativos = Config.get_ativos()
         if not ativos: return []
-
+        
         if time.time() - self.btc_train_time > 3600 or not self.btc_train_cache:
             self.btc_train_cache = self.fetch_historical_sync(ativos[0], Config.CANDLES_TREINAMENTO_ML)
             self.btc_train_time = time.time()
@@ -70,7 +78,6 @@ class MotorTreinamento:
             return []
 
     def prepare_features(self, df, btc_df=None):
-        # Usando nosso motor TA customizado sem dependências
         df = add_custom_ta(df)
 
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
@@ -87,7 +94,6 @@ class MotorTreinamento:
         df.ffill(inplace=True)
         df.fillna(0.0, inplace=True)
 
-        # Matriz 100% Causal
         ema5 = df['close'].ewm(span=5, adjust=False).mean()
         df['close_smooth'] = ema5.ewm(span=5, adjust=False).mean()
 
@@ -98,7 +104,7 @@ class MotorTreinamento:
         vol_mean, vol_std = df['volume'].rolling(20).mean(), df['volume'].rolling(20).std()
         df['vol_zscore'] = (df['volume'] - vol_mean) / (vol_std + 1e-9)
         df['price_vs_ema'] = df['close'] - df['EMA_20']
-
+        
         bbl = df.get('BBL_20_2.0', df['close'])
         bbu = df.get('BBU_20_2.0', df['close'])
         df['bb_pos'] = (df['close'] - bbl) / (bbu - bbl + 1e-9)
@@ -165,21 +171,21 @@ class MotorTreinamento:
 
     def apply_triple_barrier(self, df):
         horizon, tp_pct, sl_pct = Config.BARRIER_HORIZON, Config.BARRIER_TP_PCT, Config.BARRIER_SL_PCT
-        targets = np.full(len(df), np.nan)
+        targets = np.full(len(df), np.nan) 
         closes, highs, lows = df['close'].values, df['high'].values, df['low'].values
 
         for i in range(len(df) - horizon):
             entry, tp, sl = closes[i], closes[i] * tp_pct, closes[i] * sl_pct
             for j in range(1, horizon + 1):
-                if highs[i + j] >= tp:
+                if highs[i + j] >= tp: 
                     targets[i] = 1
                     break
-                elif lows[i + j] <= sl:
+                elif lows[i + j] <= sl: 
                     targets[i] = 2
                     break
             if np.isnan(targets[i]):
-                targets[i] = 0
-
+                targets[i] = 0 
+                
         df['target'] = targets
         return df
 
@@ -195,12 +201,29 @@ class MotorTreinamento:
         df.ffill(inplace=True)
         df = self.prepare_features(df, btc_train_df)
         df = self.apply_triple_barrier(df)
-
-        # Embargo Estatístico: Remoção estrita das últimas linhas sem desfecho resolvido
+        
         df = df.dropna(subset=['target']).copy()
 
-        if len(df) < 50:
+        if len(df) < 50: 
             return f"⚠️ Alvos insuficientes após purga em {symbol}."
+
+        # =========================================================================
+        # 🛡️ FIX INSTITUCIONAL: Injeção de Equilíbrio de Classes (Bypass do XGBoost)
+        # =========================================================================
+        df['target'] = df['target'].astype(int)
+        classes_presentes = set(df['target'].unique())
+        classes_necessarias = {0, 1, 2}
+        
+        classes_faltantes = classes_necessarias - classes_presentes
+        if classes_faltantes:
+            linhas_dummy = []
+            for c in classes_faltantes:
+                linha = df.iloc[-1:].copy()
+                linha['target'] = int(c)
+                linhas_dummy.append(linha)
+            df = pd.concat([df] + linhas_dummy, ignore_index=True)
+            df['target'] = df['target'].astype(int)
+        # =========================================================================
 
         hmm_model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42, min_covar=1e-3)
         try:
@@ -209,13 +232,12 @@ class MotorTreinamento:
                 hmm_model.fit(df[['log_return', 'volatility_cluster']])
             df['hmm_regime'] = hmm_model.predict(df[['log_return', 'volatility_cluster']])
         except Exception:
-            hmm_model = DummyHMM()
+            hmm_model = DummyHMM() 
             df['hmm_regime'] = 0
 
         features = ['RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos', 'ADX_14', 'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence', 'cvd_trend', 'oi_change', 'oi_trend', 'oi_price_divergence', 'mtf_dist_1h', 'mtf_dist_4h', 'btc_log_return', 'btc_correlation', 'noise_index']
         X, y = df[features], df['target']
 
-        # Otimização Multi-core
         lgbm = lgb.LGBMClassifier(n_estimators=120, learning_rate=0.05, max_depth=6, num_leaves=31, random_state=42, verbose=-1, n_jobs=-1)
         xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42, eval_metric='mlogloss', n_jobs=-1)
         cb_model = CatBoostClassifier(iterations=120, learning_rate=0.05, depth=5, silent=True, random_state=42, thread_count=-1)
@@ -225,7 +247,7 @@ class MotorTreinamento:
         cb_model.fit(X, y)
 
         X_meta = np.column_stack([np.asarray(lgbm.predict_proba(X)), np.asarray(xgb_model.predict_proba(X)), np.asarray(cb_model.predict_proba(X))])
-
+        
         meta_learner = LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1)
         meta_learner.fit(X_meta, y)
 
@@ -247,16 +269,15 @@ class MotorTreinamento:
     def iniciar_ciclo_treinamento(self):
         ativos = Config.get_ativos()
         logging.info(f"🚀 Iniciando Treinador Quantitativo 10/10 (Lote de {len(ativos)} moedas)...")
-
+        
         btc_data_raw = self.get_btc_data_sync()
         btc_train_df = pd.DataFrame(btc_data_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest']) if btc_data_raw else None
 
-        # Paralelização dinâmica
-        max_threads = min(16, (os.cpu_count() or 1) * 2)
-
+        max_threads = min(16, (os.cpu_count() or 1) * 2) 
+        
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
             futuros = {executor.submit(self.processar_moeda, symbol, btc_train_df): symbol for symbol in ativos}
-
+            
             for future in as_completed(futuros):
                 symbol = futuros[future]
                 try:

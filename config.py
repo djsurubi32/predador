@@ -38,9 +38,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
         return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT']
 
 class Config:
-    # ==========================================
     # CHAVES DE API E INTEGRAÇÕES
-    # ==========================================
     BYBIT_API_KEY: str = os.getenv("BYBIT_API_KEY", "")
     BYBIT_SECRET: str = os.getenv("BYBIT_SECRET", "")
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
@@ -48,15 +46,9 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    # ==========================================
-    # ⚠️ REGRAS FROUXAS PARA TESTE DE ESTRESSE
-    # ==========================================
-    # 2.0 = Aceita quase qualquer ruído do mercado. Volte para 6.0 ou 7.0 depois dos testes.
+    # REGRAS FROUXAS PARA TESTE DE ESTRESSE
     MIN_SCORE_ENTRY: float = 2.0  
-    
-    # Mantenha False durante o teste para não gastar taxas da Bybit atoa
     OPERA_CONTA_REAL: bool = False 
-    # ==========================================
 
     BASE_TARGET_BASKET_PROFIT: float = 5.00
     BASE_BASKET_TRAILING_PULLBACK: float = 1.50
