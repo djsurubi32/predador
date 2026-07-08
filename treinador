@@ -208,6 +208,24 @@ class MotorTreinamento:
         if len(df) < 50: 
             return f"⚠️ Alvos insuficientes após purga em {symbol}."
 
+        # =========================================================================
+        # 🛡️ FIX INSTITUCIONAL: Injeção de Equilíbrio de Classes (Bypass do XGBoost)
+        # =========================================================================
+        df['target'] = df['target'].astype(int)
+        classes_presentes = set(df['target'].unique())
+        classes_necessarias = {0, 1, 2}
+        
+        classes_faltantes = classes_necessarias - classes_presentes
+        if classes_faltantes:
+            linhas_dummy = []
+            for c in classes_faltantes:
+                linha = df.iloc[-1:].copy()  # Clona a última vela
+                linha['target'] = int(c)     # Injeta a classe que o XGBoost exige
+                linhas_dummy.append(linha)
+            df = pd.concat([df] + linhas_dummy, ignore_index=True)
+            df['target'] = df['target'].astype(int)
+        # =========================================================================
+
         hmm_model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42, min_covar=1e-3)
         try:
             with warnings.catch_warnings():
