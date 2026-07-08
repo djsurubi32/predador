@@ -32,7 +32,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
 
         logger.info(f"✅ Universo atualizado! O robô vai caçar nas {len(top_ativos)} moedas mais quentes do dia.")
         return top_ativos
-        
+
     except Exception as e:
         logger.error(f"❌ Erro ao buscar moedas na Bybit: {e}. Acionando lista de segurança.")
         return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT']
@@ -47,16 +47,16 @@ class Config:
     MODELS_DIR: str = "modelos_ia"
 
     # REGRAS FROUXAS PARA TESTE DE ESTRESSE
-    MIN_SCORE_ENTRY: float = 2.0  
-    OPERA_CONTA_REAL: bool = False 
+    MIN_SCORE_ENTRY: float = 2.0
+    OPERA_CONTA_REAL: bool = False
 
     BASE_TARGET_BASKET_PROFIT: float = 5.00
     BASE_BASKET_TRAILING_PULLBACK: float = 1.50
     BASE_STOP_BASKET_LOSS: float = -10.00
     BASE_BASKET_MARGIN: float = -15.0
 
-    BASE_BREAKEVEN_TRIGGER: float = 2.50  
-    BASE_BREAKEVEN_PROFIT: float = 1.00   
+    BASE_BREAKEVEN_TRIGGER: float = 2.50
+    BASE_BREAKEVEN_PROFIT: float = 1.00
 
     MAX_PENDING_ORDER_MINUTES: int = 5
     BANCA_DEMO_INICIAL: float = 100.0
@@ -72,7 +72,7 @@ class Config:
     CORRELATION_THRESHOLD: float = 0.70
     MAX_TRADE_DURATION_MINUTES: int = 240
 
-    NUM_MOEDAS_OPERACIONAIS: int = 3
+    NUM_MOEDAS_OPERACIONAIS: int = 100
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5
     TIMEFRAME: str = '15m'
