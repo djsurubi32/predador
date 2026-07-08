@@ -1,0 +1,603 @@
+import sys
+import os
+import asyncio
+import math
+import logging
+import time
+import sqlite3
+import hashlib
+from typing import Optional
+
+import ccxt
+from config import Config
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [EXECUTOR] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+class TelegramLogger:
+    @staticmethod
+    def _send_sync(message: str):
+        if not Config.TELEGRAM_TOKEN or not Config.TELEGRAM_CHAT_ID:
+            logging.warning("⚠️ Token ou Chat ID do Telegram não configurados no arquivo .env")
+            return
+        try:
+            import requests
+            url = f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/sendMessage"
+            payload = {"chat_id": Config.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+            response = requests.post(url, json=payload, timeout=5)
+
+            if response.status_code != 200:
+                logging.error(f"❌ Falha no envio do Telegram (Status {response.status_code}): {response.text}")
+        except Exception as e:
+            logging.error(f"❌ Erro crítico de rede ao conectar com a API do Telegram: {e}")
+
+    @staticmethod
+    async def send(message: str):
+        await asyncio.to_thread(TelegramLogger._send_sync, message)
+
+class BybitExecutionEngine:
+    def __init__(self, private_exchange=None, public_exchange=None, is_real_mode=True):
+        self.private_exchange = private_exchange
+        self.public_exchange = public_exchange
+        self.is_real_mode = is_real_mode
+        self.last_equity_fetch = 0
+        self.last_positions_fetch = 0
+        self.equity_cache = Config.BANCA_DEMO_INICIAL
+        self.positions_cache = []
+
+    def init_markets_sync(self):
+        if self.private_exchange:
+            try:
+                self.private_exchange.load_markets()
+                logging.info("Mecanismo de roteamento de ordens verificado com sucesso.")
+            except Exception as e:
+                logging.error(f"❌ Erro ao inicializar mercados na corretora: {e}")
+
+    async def set_leverage(self, symbol: str, leverage: int = 50):
+        if not self.private_exchange or not self.is_real_mode: return True
+        try:
+            await asyncio.to_thread(self.private_exchange.set_leverage, leverage, symbol)
+            return True
+        except Exception:
+            return True
+
+    async def get_equity(self):
+        if not self.private_exchange or not self.is_real_mode: return Config.BANCA_DEMO_INICIAL
+        now = time.time()
+        if now - self.last_equity_fetch < 3.0: return self.equity_cache
+        try:
+            balance_data = await asyncio.to_thread(self.private_exchange.fetch_balance, {'accountType': 'UNIFIED'})
+            raw_info = balance_data.get('info', {}).get('result', {}).get('list', [{}])[0]
+            equity = float(raw_info.get('totalEquity', balance_data.get('total', {}).get('USDT', 0)))
+            if equity > 0:
+                self.equity_cache = equity
+                self.last_equity_fetch = now
+            return self.equity_cache
+        except Exception:
+            return self.equity_cache
+
+    async def get_current_positions(self, db_reference=None):
+        if self.is_real_mode:
+            if not self.private_exchange: return []
+            now = time.time()
+            if now - self.last_positions_fetch < 4.0: return self.positions_cache
+            try:
+                positions = await asyncio.to_thread(self.private_exchange.fetch_positions)
+                active = []
+                for p in positions:
+                    contracts = p.get('contracts') or p.get('positionAmt')
+                    if contracts is None: continue
+                    size = float(contracts)
+
+                    if abs(size) > 0.00001:
+                        entry_price = float(p.get('entryPrice') or 0)
+                        mark_price = float(p.get('markPrice') or entry_price)
+                        unrealized_gross = float(p.get('unrealizedPnl') or 0)
+
+                        volume_entrada = abs(size) * entry_price
+                        volume_saida = abs(size) * mark_price
+                        taxa_estimada = (volume_entrada * 0.00055) + (volume_saida * 0.00055)
+                        net_pnl = unrealized_gross - taxa_estimada
+
+                        active.append({
+                            'symbol': p.get('symbol'),
+                            'side': str(p.get('side', 'long')).upper(),
+                            'contracts': abs(size),
+                            'entryPrice': entry_price,
+                            'grossPnl': unrealized_gross,
+                            'netPnl': net_pnl,
+                            'estimatedFee': taxa_estimada
+                        })
+                self.positions_cache = active
+                self.last_positions_fetch = now
+                return active
+            except Exception:
+                return self.positions_cache
+        else:
+            if db_reference is None: return []
+            try:
+                open_trades = await db_reference.get_all_open_trades()
+                if not open_trades: return []
+
+                tickers = await asyncio.to_thread(self.public_exchange.fetch_tickers)
+                active = []
+
+                for t in open_trades:
+                    symbol, side, entry, qty, open_time = t[0], t[1], float(t[2]), float(t[3]), float(t[4])
+                    ticker = tickers.get(symbol)
+                    if not ticker: continue
+
+                    current_price = float(ticker['last'] or ticker['close'] or entry)
+
+                    if side.upper() == 'BUY':
+                        unrealized_gross = (current_price - entry) * qty
+                    else:
+                        unrealized_gross = (entry - current_price) * qty
+
+                    volume_entrada = qty * entry
+                    volume_saida = qty * current_price
+                    taxa_estimada = (volume_entrada * 0.00055) + (volume_saida * 0.00055)
+                    net_pnl = unrealized_gross - taxa_estimada
+
+                    active.append({
+                        'symbol': symbol,
+                        'side': 'LONG' if side.upper() == 'BUY' else 'SHORT',
+                        'contracts': qty,
+                        'entryPrice': entry,
+                        'grossPnl': unrealized_gross,
+                        'netPnl': net_pnl,
+                        'estimatedFee': taxa_estimada
+                    })
+                return active
+            except Exception:
+                return []
+
+    async def close_position_market(self, symbol: str, side: str, amount: float):
+        if not self.private_exchange or not self.is_real_mode: return True
+        try:
+            order_side = 'sell' if side.upper() == 'BUY' else 'buy'
+            amount_str = self.private_exchange.amount_to_precision(symbol, amount)
+            await asyncio.to_thread(self.private_exchange.create_order, symbol, 'market', order_side, float(amount_str), None, {'reduceOnly': True})
+            return True
+        except Exception as e:
+            logging.error(f"Erro ao fechar posição a mercado {symbol}: {e}")
+            return False
+
+    async def close_position_limit_chase(self, symbol: str, side: str, amount: float, max_retries: int = 5):
+        if not self.private_exchange or not self.is_real_mode: return True
+        order_side = 'sell' if side.upper() == 'BUY' else 'buy'
+        remaining_amount = amount
+
+        for attempt in range(max_retries):
+            try:
+                ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
+                limit_price = float(ticker['ask']) if order_side == 'sell' else float(ticker['bid'])
+                amount_str = self.private_exchange.amount_to_precision(symbol, remaining_amount)
+                price_str = self.private_exchange.price_to_precision(symbol, limit_price)
+
+                order = await asyncio.to_thread(self.private_exchange.create_order, symbol, 'limit', order_side, float(amount_str), float(price_str), {'reduceOnly': True, 'postOnly': True})
+                await asyncio.sleep(3)
+
+                fetched_order = await asyncio.to_thread(self.private_exchange.fetch_order, order['id'], symbol, params={'acknowledged': True})
+                if fetched_order.get('status') == 'closed': return True
+                else:
+                    await asyncio.to_thread(self.private_exchange.cancel_order, order['id'], symbol)
+                    await asyncio.sleep(0.5)
+                    fetched_order_after = await asyncio.to_thread(self.private_exchange.fetch_order, order['id'], symbol, params={'acknowledged': True})
+                    filled = float(fetched_order_after.get('filled', 0.0))
+                    remaining_amount = amount - filled
+                    if remaining_amount <= 0.00001: return True
+            except Exception:
+                await asyncio.sleep(1)
+
+        if remaining_amount > 0.00001:
+            await self.close_position_market(symbol, side, remaining_amount)
+        return True
+
+    async def open_position_limit(self, symbol: str, side: str, amount: float, limit_price: float):
+        if not self.private_exchange or not self.is_real_mode: return {"status": "simulated"}
+        try:
+            await self.set_leverage(symbol, Config.ALAVANCAGEM)
+            order_side = 'buy' if side.upper() == 'BUY' else 'sell'
+            amount_str = self.private_exchange.amount_to_precision(symbol, amount)
+            price_str = self.private_exchange.price_to_precision(symbol, limit_price)
+            order = await asyncio.to_thread(self.private_exchange.create_order, symbol, 'limit', order_side, float(amount_str), float(price_str))
+            return order
+        except Exception as e:
+            logging.error(f"Erro ao abrir posição Limit em {symbol}: {e}")
+            raise
+
+class Database:
+    def __init__(self, db_name="predador_v31.db"):
+        self.db_name = db_name
+        self._create_tables()
+
+    def _create_tables(self):
+        with sqlite3.connect(self.db_name, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS trades (
+                trade_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, entry REAL,
+                sl REAL, tp REAL, qty REAL, force INTEGER, open_time REAL)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS elite_signals (
+                symbol TEXT PRIMARY KEY, direction TEXT, price REAL, prob REAL,
+                score REAL, atr REAL, sma_atr REAL, funding REAL, reasoning TEXT,
+                timestamp REAL)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT,
+                pnl REAL, outcome TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+            conn.commit()
+
+    def _get_elite_signals_sync(self):
+        with sqlite3.connect(self.db_name, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT symbol, direction, price, prob, score, atr, sma_atr, funding, reasoning FROM elite_signals')
+            rows = cursor.fetchall()
+            return [{'symbol': r[0], 'direction': r[1], 'price': r[2], 'prob': r[3], 'score': r[4], 'current_atr': r[5], 'sma_atr': r[6], 'funding': r[7], 'reasoning': r[8]} for r in rows]
+
+    async def get_elite_signals(self):
+        return await asyncio.to_thread(self._get_elite_signals_sync)
+
+    def _add_trade_sync(self, symbol, side, entry, sl, tp, qty, force):
+        trade_id = hashlib.sha256(f"{symbol}{side}{time.time():.4f}".encode()).hexdigest()[:16]
+        with sqlite3.connect(self.db_name, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''INSERT OR REPLACE INTO trades (trade_id, symbol, side, entry, sl, tp, qty, force, open_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', (trade_id, symbol, side, entry, sl, tp, qty, force, time.time()))
+            conn.commit()
+        return trade_id
+
+    async def add_trade(self, symbol, side, entry, sl, tp, qty, force):
+        return await asyncio.to_thread(self._add_trade_sync, symbol, side, entry, sl, tp, qty, force)
+
+    def _get_all_open_trades_sync(self):
+        with sqlite3.connect(self.db_name, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT symbol, side, entry, qty, open_time FROM trades')
+            return cursor.fetchall()
+
+    async def get_all_open_trades(self):
+        return await asyncio.to_thread(self._get_all_open_trades_sync)
+
+    def _remove_trade_sync(self, symbol):
+        with sqlite3.connect(self.db_name, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM trades WHERE symbol = ?', (symbol,))
+            conn.commit()
+
+    async def remove_trade(self, symbol):
+        await asyncio.to_thread(self._remove_trade_sync, symbol)
+
+    def _add_history_sync(self, symbol, side, pnl, outcome):
+        with sqlite3.connect(self.db_name, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO history (symbol, side, pnl, outcome) VALUES (?, ?, ?, ?)', (symbol, side, pnl, outcome))
+            conn.commit()
+
+    async def add_history(self, symbol, side, pnl, outcome):
+        await asyncio.to_thread(self._add_history_sync, symbol, side, pnl, outcome)
+
+class EngineExecutor:
+    def __init__(self):
+        self.public_exchange = ccxt.bybit({'enableRateLimit': True, 'rateLimit': 50, 'options': {'defaultType': 'swap'}})
+        self.private_exchange = None
+        if Config.BYBIT_API_KEY and Config.BYBIT_API_KEY != "SUA_API_KEY_BYBIT" and Config.BYBIT_API_KEY.strip() != "":
+            try:
+                self.private_exchange = ccxt.bybit({'apiKey': Config.BYBIT_API_KEY, 'secret': Config.BYBIT_SECRET, 'enableRateLimit': True, 'options': {'defaultType': 'swap', 'recvWindow': 10000}})
+            except Exception as e:
+                logging.error(f"Erro nas credenciais: {e}")
+
+        self.execution = BybitExecutionEngine(private_exchange=self.private_exchange, public_exchange=self.public_exchange, is_real_mode=Config.OPERA_CONTA_REAL)
+        self.db = Database()
+        self.max_basket_pnl = 0.0
+        self.last_global_status_time = time.time()
+        self.last_empty_heartbeat = time.time()
+        self.cooldown_memoria = {}
+        self.simulated_banca = float(Config.BANCA_DEMO_INICIAL)
+
+    def route_and_calculate_strategy(self, opp):
+        score = float(opp['score'])
+        prob = float(opp['prob'])
+
+        reasoning_clean = opp['reasoning'].replace(" ", "")
+        is_fluxo_maximo = "Fluxo:3.0" in reasoning_clean
+        is_espaco_expandido = "ML_Espaço:3.0" in reasoning_clean
+
+        if score >= 9.0 and prob >= 75.0:
+            return {
+                "vertente": "QUALIDADE EXTREMA (SNIPER)",
+                "lote_tipo": "Lote Sniper",
+                "invest_amount": 10.0,
+                "tp_factor": 1.020,
+                "sl_factor": 0.990
+            }
+        elif is_fluxo_maximo:
+            return {
+                "vertente": "SCALPING DE MOMENTUM",
+                "lote_tipo": "Lote Padrão",
+                "invest_amount": 6.0,
+                "tp_factor": 1.008,
+                "sl_factor": 0.995
+            }
+        elif is_espaco_expandido:
+            return {
+                "vertente": "DAY TRADE DE EXPANSÃO",
+                "lote_tipo": "Lote Leve",
+                "invest_amount": 4.0,
+                "tp_factor": 1.040,
+                "sl_factor": 0.980
+            }
+
+        return {
+            "vertente": "PADRÃO ADAPTATIVO",
+            "lote_tipo": "Lote de Teste",
+            "invest_amount": 2.0,
+            "tp_factor": 1.012,
+            "sl_factor": 0.988
+        }
+
+    async def reconcile_positions(self):
+        if not Config.OPERA_CONTA_REAL: return
+        try:
+            real_positions = await self.execution.get_current_positions()
+            real_symbols = {p['symbol'] for p in real_positions}
+            open_trades = await self.db.get_all_open_trades()
+
+            for trade in open_trades:
+                symbol = trade[0]
+                open_time = trade[4]
+                if symbol not in real_symbols:
+                    if time.time() - open_time < 30.0: continue
+                    if self.private_exchange:
+                        orders = await asyncio.to_thread(self.private_exchange.fetch_open_orders, symbol)
+                        if len(orders) == 0:
+                            await self.db.remove_trade(symbol)
+                    else:
+                        await self.db.remove_trade(symbol)
+        except Exception:
+            pass
+
+    async def cancel_old_pending_orders(self):
+        if not Config.OPERA_CONTA_REAL or not self.private_exchange: return
+        try:
+            open_trades = await self.db.get_all_open_trades()
+            for trade in open_trades:
+                symbol = trade[0]
+                try:
+                    orders = await asyncio.to_thread(self.private_exchange.fetch_open_orders, symbol)
+                    now = time.time()
+                    for order in orders:
+                        order_time = order['timestamp'] / 1000.0
+                        if now - order_time >= (Config.MAX_PENDING_ORDER_MINUTES * 60):
+                            await asyncio.to_thread(self.private_exchange.cancel_order, order['id'], symbol)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.1)
+        except Exception:
+            pass
+
+    async def manage_basket(self):
+        positions = await self.execution.get_current_positions(self.db)
+
+        if not positions:
+            self.max_basket_pnl = 0.0
+            now = time.time()
+            if now - self.last_empty_heartbeat > 60:
+                logging.info("⚖️ Balde vazio. Aguardando oportunidades das vertentes...")
+                self.last_empty_heartbeat = now
+            return
+
+        total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
+        total_gross_pnl = sum(float(p.get('grossPnl', 0)) for p in positions)
+        total_fees = sum(float(p.get('estimatedFee', 0)) for p in positions)
+        total_margin = sum((float(p.get('contracts', 0)) * float(p.get('entryPrice', 0))) / Config.ALAVANCAGEM for p in positions)
+
+        escala_multiplicador = total_margin / Config.BASE_BASKET_MARGIN if Config.BASE_BASKET_MARGIN != 0 else 1.0
+        if escala_multiplicador <= 0: escala_multiplicador = 1.0
+
+        alvo_dinamico = Config.BASE_TARGET_BASKET_PROFIT * escala_multiplicador
+        pullback_dinamico = Config.BASE_BASKET_TRAILING_PULLBACK * escala_multiplicador
+        stop_dinamico = Config.BASE_STOP_BASKET_LOSS * escala_multiplicador
+
+        gatilho_breakeven = Config.BASE_BREAKEVEN_TRIGGER * escala_multiplicador
+        lucro_garantido_breakeven = Config.BASE_BREAKEVEN_PROFIT * escala_multiplicador
+        passo_avanco = 1.00 * escala_multiplicador
+
+        if total_net_pnl > self.max_basket_pnl:
+            self.max_basket_pnl = total_net_pnl
+
+        breakeven_ativo = False
+        if self.max_basket_pnl >= gatilho_breakeven:
+            lucro_excedente = self.max_basket_pnl - gatilho_breakeven
+            degraus_avancados = math.floor(lucro_excedente / passo_avanco)
+            stop_dinamico = lucro_garantido_breakeven + (degraus_avancados * passo_avanco)
+            breakeven_ativo = True
+
+        status_trailing_local = "🟢 TRAILING ARMADO" if self.max_basket_pnl >= alvo_dinamico else (f"🔵 CATRACA ATIVA (+${stop_dinamico:.2f})" if breakeven_ativo else "🟡 BUSCANDO ALVO")
+
+        logging.info(f"🛡️ GESTÃO LÍQUIDA | Pos: {len(positions)} | Margem: ${total_margin:.2f} | PnL: ${total_net_pnl:.2f} | Stop: ${stop_dinamico:.2f} | Status: {status_trailing_local}")
+
+        if Config.OPERA_CONTA_REAL and time.time() - self.last_global_status_time >= 900:
+            banca = await self.execution.get_equity()
+            await TelegramLogger.send(f"📊 <b>MONITOR DE RISCO LÍQUIDO</b>\nBanca Real: ${banca:.2f}\nLucro Bruto: ${total_gross_pnl:.2f}\nTaxas: -${total_fees:.2f}\n<b>Lucro Líquido: ${total_net_pnl:.2f}</b>\nStatus: {status_trailing_local}")
+            self.last_global_status_time = time.time()
+
+        if self.max_basket_pnl >= alvo_dinamico and (self.max_basket_pnl - total_net_pnl) >= pullback_dinamico:
+            if not Config.OPERA_CONTA_REAL:
+                self.simulated_banca += total_net_pnl
+            banca_atual = self.simulated_banca if not Config.OPERA_CONTA_REAL else await self.execution.get_equity()
+
+            tag_modo = "REAL" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO"
+            await TelegramLogger.send(
+                f"🎯 <b>TRAILING GLOBAL ATIVADO [{tag_modo}]</b>\n"
+                f"Esvaziando balde adaptativo.\n"
+                f"Resultado LÍQUIDO líquido: <b>${total_net_pnl:.2f}</b>\n"
+                f"<b>Saldo da banca:</b> <b>${banca_atual:.2f}</b>"
+            )
+            await self.close_all_positions(total_net_pnl, "TRAILING BALDE ADAPTATIVO")
+            self.max_basket_pnl = 0.0
+            return
+
+        if total_net_pnl <= stop_dinamico:
+            if not Config.OPERA_CONTA_REAL:
+                self.simulated_banca += total_net_pnl
+            banca_atual = self.simulated_banca if not Config.OPERA_CONTA_REAL else await self.execution.get_equity()
+
+            tag_modo = "REAL" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO"
+            if breakeven_ativo:
+                await TelegramLogger.send(
+                    f"🔵 <b>CATRACA MÓVEL ACIONADA [{tag_modo}]</b>\n"
+                    f"Proteção elástica executada.\n"
+                    f"Resultado líquido: <b>${total_net_pnl:.2f}</b>\n"
+                    f"<b>Saldo da banca:</b> <b>${banca_atual:.2f}</b>"
+                )
+            else:
+                await TelegramLogger.send(
+                    f"🛑 <b>STOP LOSS DO BALDE ACIONADO [{tag_modo}]</b>\n"
+                    f"Cortando perdas líquidas agregadas em: <b>${total_net_pnl:.2f}</b>\n"
+                    f"<b>Saldo da banca:</b> <b>${banca_atual:.2f}</b>"
+                )
+            await self.close_all_positions(total_net_pnl, "STOP LOSS ADAPTATIVO")
+            self.max_basket_pnl = 0.0
+
+    async def close_all_positions(self, final_pnl, reason):
+        try:
+            positions = await self.execution.get_current_positions(self.db)
+            tasks = []
+            is_profit_close = "TRAILING" in reason.upper() or "BREAKEVEN" in reason.upper() or "CATRACA" in reason.upper()
+
+            for p in positions:
+                symbol = p['symbol']
+                side = 'BUY' if str(p.get('side', '')).lower() in ['long', 'buy'] else 'SELL'
+                qty = float(p.get('contracts', 0))
+                if qty > 0.00001:
+                    if is_profit_close: tasks.append(self.execution.close_position_limit_chase(symbol, side, qty))
+                    else: tasks.append(self.execution.close_position_market(symbol, side, qty))
+
+            if tasks: await asyncio.gather(*tasks, return_exceptions=True)
+
+            open_trades = await self.db.get_all_open_trades()
+            for t in open_trades:
+                await self.db.add_history(t[0], t[1], 0.0, reason)
+                await self.db.remove_trade(t[0])
+        except Exception as e:
+            logging.error(f"Erro crítico no esvaziamento do balde: {e}")
+
+    def calculate_fixed_tier_lot_size(self, total_score):
+        if total_score < 6.0: return 0.0, "Rejeitado"
+        elif total_score < 7.0: return 2.0, "Lote de Teste"
+        elif total_score < 8.0: return 4.0, "Lote Leve"
+        elif total_score < 9.0: return 6.0, "Lote Padrão"
+        else: return 10.0, "Lote Sniper"
+
+    async def execute_trade(self, opp):
+        symbol = opp['symbol']
+        action = opp['direction']
+
+        if symbol in self.cooldown_memoria:
+            if time.time() - self.cooldown_memoria[symbol] < 120.0: return False
+
+        open_trades_data = await self.db.get_all_open_trades()
+        open_trades = [t[0] for t in open_trades_data]
+        if symbol in open_trades: return False
+
+        max_trades = Config.MAX_OPEN_TRADES
+        if len(open_trades) >= max_trades: return False
+
+        strat = self.route_and_calculate_strategy(opp)
+        invest_amount = strat['invest_amount']
+        if invest_amount < 2.0: return False
+
+        entry_price = float(opp['price'])
+        raw_qty = (invest_amount * Config.ALAVANCAGEM) / entry_price
+
+        tp_price = entry_price * strat['tp_factor'] if action == 'BUY' else entry_price * (2.0 - strat['tp_factor'])
+        sl_price = entry_price * strat['sl_factor'] if action == 'BUY' else entry_price * (2.0 - strat['sl_factor'])
+
+        banca_atual = self.simulated_banca if not Config.OPERA_CONTA_REAL else await self.execution.get_equity()
+
+        template_mensagem = (
+            f"🔬 <b>[SIMULAÇÃO] ORDEM DETECTADA | {strat['vertente']}</b>\n\n"
+            f"<b>Ativo:</b> {symbol}, <b>direção:</b> {action}\n"
+            f"<b>Valor alocado:</b> ${invest_amount:.2f} ({strat['lote_tipo']})\n"
+            f"<b>Score:</b> {opp['score']:.1f}/10.0 | <b>probabilidade:</b> {opp['prob']:.1f}%\n"
+            f"<b>Ml:</b> {opp['reasoning']}\n"
+            f"<b>Saldo da banca:</b> ${banca_atual:.2f}"
+        ) if not Config.OPERA_CONTA_REAL else (
+            f"🟢 <b>ORDEM REAL DISPARADA | {strat['vertente']}</b>\n\n"
+            f"<b>Ativo:</b> {symbol}, <b>direção:</b> {action}\n"
+            f"<b>Valor alocado:</b> ${invest_amount:.2f} ({strat['lote_tipo']})\n"
+            f"<b>Score:</b> {opp['score']:.1f}/10.0 | <b>probabilidade:</b> {opp['prob']:.1f}%\n"
+            f"<b>Ml:</b> {opp['reasoning']}\n"
+            f"<b>Saldo da banca:</b> ${banca_atual:.2f}"
+        )
+
+        try:
+            if Config.OPERA_CONTA_REAL:
+                limit_price = entry_price * 0.9995 if action == 'BUY' else entry_price * 1.0005
+                success = await self.execution.open_position_limit(symbol, action, raw_qty, limit_price)
+                if success:
+                    self.cooldown_memoria[symbol] = time.time()
+                    await self.db.add_trade(symbol, action, limit_price, sl_price, tp_price, raw_qty, int(opp['score']))
+                    await TelegramLogger.send(template_mensagem)
+                    return True
+            else:
+                self.cooldown_memoria[symbol] = time.time()
+                await self.db.add_trade(symbol, action, entry_price, sl_price, tp_price, raw_qty, int(opp['score']))
+                logging.info(f"🔬 [SIMULADO - {strat['vertente']}] {action} em {symbol} | Lote: {strat['lote_tipo']} (${invest_amount})")
+
+                await TelegramLogger.send(template_mensagem)
+                return True
+            return False
+        except Exception as e:
+            logging.error(f"Erro ao tentar executar operação em {symbol}: {e}")
+            return False
+
+    async def start_execution_loop(self):
+        await asyncio.to_thread(self.execution.init_markets_sync)
+
+        modo_atual = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO/DEMO 🔬"
+        await TelegramLogger.send(
+            f"🚀 <b>PREDADOR QUANTITATIVO ONLINE</b>\n"
+            f"O motor executor foi iniciado com sucesso!\n"
+            f"Modo Operacional: <b>{modo_atual}</b>\n"
+            f"Alavancagem Fixa: {Config.ALAVANCAGEM}x\n"
+            f"Limite do Balde: {Config.MAX_OPEN_TRADES} trades simultâneos.\n"
+            f"<b>Saldo Inicial:</b> ${self.simulated_banca:.2f}"
+        )
+
+        logging.info("🚀 Motor Executor de Três Vertentes Online e integrado ao Telegram.")
+        ciclo_segundos = float(Config.CICLO_SEGUNDOS)
+
+        while True:
+            try:
+                await self.manage_basket()
+                await self.cancel_old_pending_orders()
+
+                open_trades_data = await self.db.get_all_open_trades()
+                open_trades_count = len(open_trades_data)
+                max_trades = Config.MAX_OPEN_TRADES
+
+                if open_trades_count >= max_trades:
+                    await asyncio.sleep(ciclo_segundos)
+                    continue
+
+                opportunities = await self.db.get_elite_signals()
+                if opportunities:
+                    top_opps = sorted(opportunities, key=lambda x: x['score'], reverse=True)
+                    for opp in top_opps:
+                        current_open = await self.db.get_all_open_trades()
+                        if len(current_open) >= max_trades: break
+                        await self.execute_trade(opp)
+
+                await asyncio.sleep(ciclo_segundos)
+            except Exception as e:
+                logging.error(f"Erro no loop principal do executor: {e}")
+                await asyncio.sleep(2)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(EngineExecutor().start_execution_loop())
+    except KeyboardInterrupt:
+        logging.info("🛑 Executor encerrado pelo usuário.")
