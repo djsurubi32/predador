@@ -32,6 +32,7 @@ class DummyHMM:
 
 class MotorTreinamento:
     def __init__(self):
+        # 🚀 EXPANSÃO DA RODOVIA DE REDE (POOL SIZE = 100)
         session = requests.Session()
         adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
         session.mount('http://', adapter)
@@ -236,7 +237,7 @@ class MotorTreinamento:
             df['hmm_regime'] = 0
 
         features = ['RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos', 'ADX_14', 'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence', 'cvd_trend', 'oi_change', 'oi_trend', 'oi_price_divergence', 'mtf_dist_1h', 'mtf_dist_4h', 'btc_log_return', 'btc_correlation', 'noise_index']
-        X, y = df[features], df['target']
+        X, y = df[features], df['target'].astype(int)
 
         lgbm = lgb.LGBMClassifier(n_estimators=120, learning_rate=0.05, max_depth=6, num_leaves=31, random_state=42, verbose=-1, n_jobs=-1)
         xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42, eval_metric='mlogloss', n_jobs=-1)
