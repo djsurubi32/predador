@@ -32,7 +32,6 @@ class DummyHMM:
 
 class MotorTreinamento:
     def __init__(self):
-        # 🚀 EXPANSÃO DA RODOVIA DE REDE (POOL SIZE = 100)
         session = requests.Session()
         adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
         session.mount('http://', adapter)
@@ -59,8 +58,12 @@ class MotorTreinamento:
 
     def fetch_historical_sync(self, symbol, limit):
         try:
+            # 🛡️ FIX INSTITUCIONAL: Acelerador controlado para respeitar a Bybit
+            time.sleep(1.5) 
+            
             ohlcv = self.exchange.fetch_ohlcv(symbol, Config.TIMEFRAME, limit=limit)
             try:
+                time.sleep(0.5) # Pausa extra para os dados de Open Interest
                 oi_data = self.exchange.fetch_open_interest_history(symbol, Config.TIMEFRAME, limit=limit)
                 oi_map = {int(item.get('timestamp', 0)): float(item.get('openInterestValue') or item.get('info', {}).get('openInterest', 0)) for item in oi_data}
             except Exception:
@@ -208,9 +211,6 @@ class MotorTreinamento:
         if len(df) < 50: 
             return f"⚠️ Alvos insuficientes após purga em {symbol}."
 
-        # =========================================================================
-        # 🛡️ FIX INSTITUCIONAL: Injeção de Equilíbrio de Classes (Bypass do XGBoost)
-        # =========================================================================
         df['target'] = df['target'].astype(int)
         classes_presentes = set(df['target'].unique())
         classes_necessarias = {0, 1, 2}
@@ -224,7 +224,6 @@ class MotorTreinamento:
                 linhas_dummy.append(linha)
             df = pd.concat([df] + linhas_dummy, ignore_index=True)
             df['target'] = df['target'].astype(int)
-        # =========================================================================
 
         hmm_model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42, min_covar=1e-3)
         try:
@@ -274,7 +273,8 @@ class MotorTreinamento:
         btc_data_raw = self.get_btc_data_sync()
         btc_train_df = pd.DataFrame(btc_data_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest']) if btc_data_raw else None
 
-        max_threads = min(16, (os.cpu_count() or 1) * 2) 
+        # 🛡️ FIX INSTITUCIONAL: Limita a 2 processos simultâneos para evitar banimento da Bybit
+        max_threads = 2 
         
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
             futuros = {executor.submit(self.processar_moeda, symbol, btc_train_df): symbol for symbol in ativos}
