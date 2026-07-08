@@ -1,79 +1,104 @@
-importar os
-importar registro
-importar ccxt
-de digitando importar Lista,Tupla
-de dotenv importar carregar_dotenv
-registro.configuração básica(
-    nível=registro.INFORMAÇÕES,
-    formatar='%(asctime)s - %(levelname)s - %(message)s',
-    formato de data='%Y-%m-%d %H:%M:%S'
+import os
+import logging
+import ccxt
+from typing import List, Tuple
+from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-lenhador = registro.obterLogger(__nome__)
-carregar_dotenv()
-definição obter_melhores_moedas(limite:inteiro = 100)-> Lista[str]:
-    lenhador.informações(f"🔄 Conectando ao Bybit para buscar o Top{limite}de criptomoedas mais negociadas hoje...")
-    tentar:
-        intercâmbio = ccxt.bybit({'ativar limite de taxa':Verdadeiro,'opções': {'tipo padrão':'trocar'}})
-        intercâmbio.carregar_mercados()
-        tickers = intercâmbio.buscar_tickers()
-        _validas:Lista[Tupla[str,flutuador]]=[]
-        para símbolo,ticker em tickers.Unid():
-            mercado = intercâmbio.mercados.pegar(símbolo)
-            se mercado e mercado.pegar('linear')e mercado.pegar('citar')== 'USDT' e mercado.pegar('ativo'):
-                volume_24h = flutuador(ticker.pegar('quoteVolume',0)ou 0)
-                _validas.acrescentar((símbolo,volume_24h))
-        _validas.organizar(chave=lambda x:x[1],reverter=Verdadeiro)
-        top_ativos =[x[0]para x em _validas[:limite]]
-        lenhador.informações(f"✅ Universo atualizado! O robô vai caçar nas{len(top_ativos)}"Cabine mais quentes do dia.")
-        retornar top_ativos
-    exceto Exceção como e:
-        lenhador.erro(f"❌ Erro ao buscar moedas na Bybit:{e}. Acionando lista de segurança.")
-        retornar['BTC/USDT:USDT','ETH/USDT:USDT','SOL/USDT:USDT','BNB/USDT:USDT']
-aula Configuração:
-    BYBIT_API_KEY:str = os.getenv("BYBIT_API_KEY","")
-    BYBIT_SECRET:str = os.getenv("BYBIT_SECRET","")
-    TELEGRAM_TOKEN:str = os.getenv("TELEGRAM_TOKEN","")
-    ID_DO_CHAT_DO_TELEGRAM:str = os.getenv("ID_DO_CHAT_DO_TELEGRAM","")
-    MODELOS_DIR:str = "modelos_ia"
-    #GESTÃO DE RISCO DO BALDE GLOBAL
-    LUCRO DA CESTA BASE_ALVO:flutuador = 5,00
-    BASE_BASKET_TRAILING_PULLBACK:flutuador = 1,50
-    BASE_STOP_BASKET_LOSS:flutuador = -10,00
-    MARGEM_DA_CESTA_BASE:flutuador = -15.0
-    # PONTO DE EQUILÍBRIO DINÂMICO
-    GATILHO_DE_BREAKVEN_BASE:flutuador = 2,50
-    LUCRO_DE_EQUILÍBRIO_BASE:flutuador = 1,00
-    ENTRADA_DE_PONTUAÇÃO_MIN:flutuador = 3.0
-    MAX_PENDING_ORDER_MINUTES:inteiro = 5
-    OPERA_CONTA_REAL:booleano = Falso
-    BANCA_DEMO_INICIAL:flutuador = 100,0
-    KELLY_FRAÇÃO:flutuador = 0,045
-    RELAÇÃO RISCO-RECOMPENSA:flutuador = 2.0
-    RISCO_MÁXIMO_DE_POSIÇÃO:flutuador = 0,045
-    MÁXIMO DE NEGOCIAÇÕES ABERTAS:inteiro = 10
-    ALAVANCAGEM:inteiro = 100
-    HORIZONTE DE BARREIRA:inteiro = 20
-    BARRIER_TP_PCT:flutuador = 1.012
-    BARRIER_SL_PCT:flutuador = 0,988
-    LIMIAR DE CORRELAÇÃO:flutuador = 0,70
-    DURAÇÃO_MÁXIMA_DA_NEGOCIAÇÃO_EM_MINUTOS:inteiro = 240
-    # Calibrado para o limite estrito de 2GB de RAM do servidor
-    NUM_MOEDAS_OPERACIONAIS:inteiro = 30
-    CICLO_SEGUNDOS:inteiro = 1
-    TEMPO_ESPERA_HOLD_MINUTOS:inteiro = 5
-    PERÍODO DE TEMPO:str = '15m'
-    VELAS_TREINAMENTO_ML:inteiro = 1500
-    HORAS_RETREINO:inteiro = 4
-    NOME_DO_MODELO_NLP:str = 'todos-MiniLM-L6-v2'
-    _ATIVOS:Lista[str]=[]
-    @método de classe
-    definição obter_ativos(cls)-> Lista[str]:
-        se não cls._ATIVOS:
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+def obter_melhores_moedas(limite: int = 30) -> List[str]:
+    logger.info(f"🔄 Conectando à Bybit para buscar o Top {limite} de criptomoedas mais negociadas hoje...")
+    try:
+        exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+        exchange.load_markets()
+        tickers = exchange.fetch_tickers()
+
+        moedas_validas: List[Tuple[str, float]] = []
+        for symbol, ticker in tickers.items():
+            market = exchange.markets.get(symbol)
+            if market and market.get('linear') and market.get('quote') == 'USDT' and market.get('active'):
+                volume_24h = float(ticker.get('quoteVolume', 0) or 0)
+                moedas_validas.append((symbol, volume_24h))
+
+        moedas_validas.sort(key=lambda x: x[1], reverse=True)
+        top_ativos = [x[0] for x in moedas_validas[:limite]]
+
+        logger.info(f"✅ Universo atualizado! O robô vai caçar nas {len(top_ativos)} moedas mais quentes do dia.")
+        return top_ativos
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao buscar moedas na Bybit: {e}. Acionando lista de segurança.")
+        return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT']
+
+class Config:
+    # ==========================================
+    # CHAVES DE API E INTEGRAÇÕES
+    # ==========================================
+    BYBIT_API_KEY: str = os.getenv("BYBIT_API_KEY", "")
+    BYBIT_SECRET: str = os.getenv("BYBIT_SECRET", "")
+    TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    MODELS_DIR: str = "modelos_ia"
+
+    # ==========================================
+    # ⚠️ REGRAS FROUXAS PARA TESTE DE ESTRESSE
+    # ==========================================
+    # 2.0 = Aceita quase qualquer ruído do mercado. Volte para 6.0 ou 7.0 depois dos testes.
+    MIN_SCORE_ENTRY: float = 2.0  
+    
+    # Mantenha False durante o teste para não gastar taxas da Bybit atoa
+    OPERA_CONTA_REAL: bool = False 
+    # ==========================================
+
+    BASE_TARGET_BASKET_PROFIT: float = 5.00
+    BASE_BASKET_TRAILING_PULLBACK: float = 1.50
+    BASE_STOP_BASKET_LOSS: float = -10.00
+    BASE_BASKET_MARGIN: float = -15.0
+
+    BASE_BREAKEVEN_TRIGGER: float = 2.50  
+    BASE_BREAKEVEN_PROFIT: float = 1.00   
+
+    MAX_PENDING_ORDER_MINUTES: int = 5
+    BANCA_DEMO_INICIAL: float = 100.0
+    KELLY_FRACTION: float = 0.045
+    RISK_REWARD_RATIO: float = 2.0
+    MAX_POSITION_RISK: float = 0.045
+    MAX_OPEN_TRADES: int = 10
+    ALAVANCAGEM: int = 100
+
+    BARRIER_HORIZON: int = 20
+    BARRIER_TP_PCT: float = 1.012
+    BARRIER_SL_PCT: float = 0.988
+    CORRELATION_THRESHOLD: float = 0.70
+    MAX_TRADE_DURATION_MINUTES: int = 240
+
+    NUM_MOEDAS_OPERACIONAIS: int = 30
+    CICLO_SEGUNDOS: int = 1
+    TEMPO_ESPERA_HOLD_MINUTOS: int = 5
+    TIMEFRAME: str = '15m'
+    CANDLES_TREINAMENTO_ML: int = 1500
+    HORAS_RETREINO: int = 4
+    NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
+
+    _ATIVOS: List[str] = []
+
+    @classmethod
+    def get_ativos(cls) -> List[str]:
+        if not cls._ATIVOS:
             cls._ATIVOS = obter_melhores_moedas(cls.NUM_MOEDAS_OPERACIONAIS)
-        retornar cls._ATIVOS
-    @método de classe
-    definição inicializar_(cls)-> Nenhum:
-        se não os.caminho.existe(cls.MODELOS_DIR):
-            os.makedirs(cls.MODELOS_DIR)
-            lenhador.informações(f"📁 Diretório '{cls.MODELOS_DIR}' preparado com sucesso.")
-Configuração.inicializar_()
+        return cls._ATIVOS
+
+    @classmethod
+    def inicializar_estrutura(cls) -> None:
+        if not os.path.exists(cls.MODELS_DIR):
+            os.makedirs(cls.MODELS_DIR)
+
+Config.inicializar_estrutura()
