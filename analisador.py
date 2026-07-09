@@ -8,12 +8,12 @@ import sqlite3
 import joblib
 import warnings
 
+import requests
+from requests.adapters import HTTPAdapter
 import ccxt
 import pandas as pd
 import numpy as np
 from numpy.linalg import norm
-import feedparser
-from sentence_transformers import SentenceTransformer
 
 from config import Config
 from ta_indicators import add_custom_ta
@@ -30,7 +30,6 @@ class Database:
         self._create_tables()
 
     def _create_tables(self):
-        """Cria as tabelas nativamente usando isolamento de conexão seguro."""
         with sqlite3.connect(self.db_name, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS trades (
@@ -70,9 +69,14 @@ class Database:
 
 class LiquidityCore:
     def __init__(self):
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        
         self.exchanges = {
-            "Binance": ccxt.binance({'enableRateLimit': True}),
-            "Bybit": ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
+            "Binance": ccxt.binance({'enableRateLimit': True, 'session': session}),
+            "Bybit": ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}, 'session': session}),
         }
         self.ob_history = {name: {} for name in self.exchanges.keys()}
 
@@ -114,14 +118,14 @@ class LiquidityCore:
         symbol_spot = symbol.split(':')[0]
         tasks = [asyncio.to_thread(self.fetch_liquidity_data_sync, ex, name, symbol_spot) for name, ex in self.exchanges.items()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        
         valid_results = []
         for r in results:
             if isinstance(r, Exception) or not isinstance(r, tuple):
                 valid_results.append((50.0, 50.0, False, False))
             else:
                 valid_results.append(r)
-
+                
         return {name: r[0] for name, r in zip(self.exchanges.keys(), valid_results)}, \
                {name: r[1] for name, r in zip(self.exchanges.keys(), valid_results)}, \
                {name: r[2] for name, r in zip(self.exchanges.keys(), valid_results)}, \
@@ -129,49 +133,29 @@ class LiquidityCore:
 
 class LocalNewsCore:
     def __init__(self):
-        try:
-            self.model = SentenceTransformer(Config.NLP_MODEL_NAME)
-            self.bull_emb = self.model.encode(["bull market positive good news surge adoption"])
-            self.bear_emb = self.model.encode(["bear market crash negative bad news regulation"])
-        except Exception:
-            self.model = None
         self.last_fetch = 0
         self.current_sentiment = 0.0
 
     def fetch_and_score_sync(self):
-        if not self.model: return 0.0
-        titles = []
-        for url in ["https://cointelegraph.com/rss", "https://www.coindesk.com/arc/outboundfeeds/rss/"]:
-            try:
-                feed = feedparser.parse(url)
-                titles.extend([entry.title for entry in feed.entries[:8]])
-            except Exception:
-                pass
-        if not titles: return 0.0
-        try:
-            embs = self.model.encode(titles)
-            bull = np.dot(embs, self.bull_emb.T) / (norm(embs, axis=1, keepdims=True) * norm(self.bull_emb))
-            bear = np.dot(embs, self.bear_emb.T) / (norm(embs, axis=1, keepdims=True) * norm(self.bear_emb))
-            return float(np.mean(bull - bear))
-        except Exception:
-            return 0.0
+        return 0.0
 
     async def get_sentiment_score(self):
-        now = time.time()
-        if now - self.last_fetch > 300:
-            self.current_sentiment = await asyncio.to_thread(self.fetch_and_score_sync)
-            self.last_fetch = now
-        return self.current_sentiment
+        return 0.0
 
 class RadarCore:
     def __init__(self):
-        self.public_exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        
+        self.public_exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}, 'session': session})
         self.db = Database()
         self.liquidity = LiquidityCore()
         self.news = LocalNewsCore()
-        self.next_trade_time = {ativo: 0 for ativo in Config.get_ativos()}
+        self.next_trade_time = {}
         self.loaded_models = {}
-        self.MAX_MODELS_IN_RAM = 30
+        self.MAX_MODELS_IN_RAM = 10 
 
     def load_brain(self, symbol):
         safe_name = symbol.replace('/', '_').replace(':', '_')
@@ -190,9 +174,8 @@ class RadarCore:
         return self.loaded_models[symbol]['brain']
 
     def prepare_features(self, df, btc_df=None):
-        # Usando nosso motor de indicadores
         df = add_custom_ta(df)
-
+        
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
         ema26 = df['close'].ewm(span=26, adjust=False).mean()
         df['MACD_12_26_9'] = ema12 - ema26
@@ -201,7 +184,6 @@ class RadarCore:
         for col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
         df.ffill(inplace=True); df.fillna(0.0, inplace=True)
 
-        # Matriz Causal
         ema5 = df['close'].ewm(span=5, adjust=False).mean()
         df['close_smooth'] = ema5.ewm(span=5, adjust=False).mean()
 
@@ -210,11 +192,11 @@ class RadarCore:
         df['volatility_cluster'] = df['log_return'].rolling(window=20).std()
         df['vol_zscore'] = (df['volume'] - df['volume'].rolling(20).mean()) / (df['volume'].rolling(20).std() + 1e-9)
         df['price_vs_ema'] = df['close'] - df['EMA_20']
-
+        
         bbl = df.get('BBL_20_2.0', df['close'])
         bbu = df.get('BBU_20_2.0', df['close'])
         df['bb_pos'] = (df['close'] - bbl) / (bbu - bbl + 1e-9)
-
+        
         df['rsi_slope'] = df.get('RSI_14', pd.Series(0, index=df.index)).diff(3)
         df['price_slope'] = df['close_smooth'].diff(3).fillna(0.0)
         df['rsi_divergence'] = np.where((df['price_slope'] < 0) & (df['rsi_slope'] > 0), 1, np.where((df['price_slope'] > 0) & (df['rsi_slope'] < 0), -1, 0))
@@ -296,11 +278,10 @@ class RadarCore:
 
     def calculate_conviction_score(self, direction, ml_prob, vwap_dict, cvd_dict, spoof_buy_dict, spoof_sell_dict, nlp_sentiment, current_atr, raw_price):
         ml_pts = 0.0
-        if ml_prob >= 80.0: ml_pts = 4.0
-        elif ml_prob >= 70.0: ml_pts = 3.0
-        elif ml_prob >= 65.0: ml_pts = 2.0
-        elif ml_prob >= 60.0: ml_pts = 1.0
-        else: return 0, 1, f"VETO ML: Probabilidade Baixa ({ml_prob:.1f}%)."
+        # CORTE SEVERO: Apenas IA com mais de 90% de certeza
+        if ml_prob >= 95.0: ml_pts = 5.0
+        elif ml_prob >= 90.0: ml_pts = 4.0
+        else: return 0, 1, f"VETO ML: Probabilidade Abaixo de 90% ({ml_prob:.1f}%)."
 
         expected_move_pct = (current_atr * 2.0 / raw_price) * 100.0
         espaco_pts = 0.0
@@ -335,43 +316,52 @@ class RadarCore:
         return total, (2 if total >= 8.0 else 1), motivo_detalhado
 
     async def scan_market(self):
-        ativos = Config.get_ativos()
-        logging.info(f"📡 Varrendo {len(ativos)} moedas na Nova Escala (0 a 10)...")
+        logging.info(f"📡 Radar inicializado. As moedas serão atualizadas a cada 5 minutos.")
         while True:
             try:
+                # O universo é atualizado e consultado dinamicamente no início de cada ciclo do Radar
+                ativos = Config.get_ativos()
                 open_trades = await self.db.get_open_trades_count()
-                if open_trades >= Config.MAX_OPEN_TRADES:
+                vagas_disponiveis = Config.MAX_OPEN_TRADES - open_trades
+                
+                if vagas_disponiveis <= 0:
                     logging.info("⏸️ Balde global cheio. Radar em espera.")
                     await asyncio.sleep(60)
                     continue
 
                 nlp_score = await self.news.get_sentiment_score()
                 cycle_opportunities = []
+                
                 for s in ativos:
                     signal = await self.analyze_symbol(s, nlp_score)
                     if signal: cycle_opportunities.append(signal)
                     await asyncio.sleep(0.1)
 
                 if cycle_opportunities:
-                    all_sorted = sorted(cycle_opportunities, key=lambda x: (x['score'], x['expected_move'], x['prob']), reverse=True)
-                    top_opps = [opp for opp in all_sorted if opp['score'] >= Config.MIN_SCORE_ENTRY][:20]
+                    # RANQUEAMENTO: Prioriza Probabilidade da IA primeiro, depois o Score, depois o espaço
+                    all_sorted = sorted(cycle_opportunities, key=lambda x: (x['prob'], x['score'], x['expected_move']), reverse=True)
+                    
+                    # Filtra apenas quem atingiu a nota mínima geral
+                    valid_opps = [opp for opp in all_sorted if opp['score'] >= Config.MIN_SCORE_ENTRY]
+                    
+                    # LIMITA as oportunidades APENAS ao número de vagas que temos no balde agora (as MELHORES do ciclo)
+                    top_opps = valid_opps[:vagas_disponiveis]
 
                     if top_opps:
                         await self.db.update_elite_signals(top_opps)
-                        logging.info(f"🏆 Mesa do Leilão atualizada com {len(top_opps)} oportunidades.")
+                        logging.info(f"🏆 Mesa do Leilão atualizada com as {len(top_opps)} MELHORES oportunidades (Vagas: {vagas_disponiveis}).")
+                        
                         for opp in top_opps:
-                            logging.info(f"🔥 SINAL DETETADO ({opp['symbol']}): {opp['direction']} | Score: {opp['score']:.1f}/10 | {opp['reasoning']}")
-                            self.next_trade_time[opp['symbol']] = time.time() + (Config.TEMPO_ESPERA_HOLD_MINUTOS * 60)
+                            logging.info(f"🔥 SINAL RANKING 1º ESCALÃO ({opp['symbol']}): {opp['direction']} | Score: {opp['score']:.1f}/10 | Prob: {opp['prob']:.1f}% | {opp['reasoning']}")
+                            # TRAVA ANTI-REPETIÇÃO: Bloqueia a moeda por 60 minutos para não reentrar no mesmo candle
+                            self.next_trade_time[opp['symbol']] = time.time() + (60 * 60)
+                        
                         for opp in all_sorted:
-                            if opp['score'] < Config.MIN_SCORE_ENTRY:
+                            if opp not in top_opps:
                                 self.next_trade_time[opp['symbol']] = time.time() + (Config.TEMPO_ESPERA_HOLD_MINUTOS * 60)
                     else:
                         await self.db.update_elite_signals([])
-                        best_5 = all_sorted[:5]
-                        relatorio = f"♻️ Varredura concluída. Nenhuma atingiu o corte ({Config.MIN_SCORE_ENTRY}/10).\n"
-                        for i, opp in enumerate(best_5, 1):
-                            relatorio += f"   {i}º {opp['symbol']} ({opp['direction']}) | Score: {opp['score']:.1f} | Motivo: {opp['reasoning']}\n"
-                        logging.info(relatorio.strip())
+                        logging.info(f"♻️ Varredura concluída. Nenhuma superou a nota de corte ({Config.MIN_SCORE_ENTRY}/10) e Probabilidade > 90%.")
                         for opp in all_sorted:
                             self.next_trade_time[opp['symbol']] = time.time() + (Config.TEMPO_ESPERA_HOLD_MINUTOS * 60)
                 else:

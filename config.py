@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import ccxt
 from typing import List, Tuple
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 def obter_melhores_moedas(limite: int = 30) -> List[str]:
-    logger.info(f"🔄 Conectando à Bybit para buscar o Top {limite} de criptomoedas mais negociadas hoje...")
+    logger.info(f"🔄 Conectando à Bybit para buscar o Top {limite} de criptomoedas mais negociadas...")
     try:
         exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
         exchange.load_markets()
@@ -30,9 +31,9 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
         moedas_validas.sort(key=lambda x: x[1], reverse=True)
         top_ativos = [x[0] for x in moedas_validas[:limite]]
 
-        logger.info(f"✅ Universo atualizado! O robô vai caçar nas {len(top_ativos)} moedas mais quentes do dia.")
+        logger.info(f"✅ Universo rotativo atualizado! As {len(top_ativos)} moedas mais quentes agora estão no radar.")
         return top_ativos
-
+        
     except Exception as e:
         logger.error(f"❌ Erro ao buscar moedas na Bybit: {e}. Acionando lista de segurança.")
         return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
@@ -47,23 +48,24 @@ class Config:
     MODELS_DIR: str = "modelos_ia"
 
     # FILTRO SEVERO ATIVADO
-    MIN_SCORE_ENTRY: float = 7.0
-    OPERA_CONTA_REAL: bool = False
+    MIN_SCORE_ENTRY: float = 7.0  
+    OPERA_CONTA_REAL: bool = False 
 
+    # GESTÃO MATEMÁTICA DO BALDE (Lotes de $2.00 | Alavancagem 100x | 5 Vagas)
     BASE_TARGET_BASKET_PROFIT: float = 5.00
-    BASE_BASKET_TRAILING_PULLBACK: float = 1.50
-    BASE_STOP_BASKET_LOSS: float = -10.00
-    BASE_BASKET_MARGIN: float = -15.0
+    BASE_BASKET_TRAILING_PULLBACK: float = 1.00
+    BASE_STOP_BASKET_LOSS: float = -6.50
+    BASE_BASKET_MARGIN: float = -9.00
 
-    BASE_BREAKEVEN_TRIGGER: float = 2.50
-    BASE_BREAKEVEN_PROFIT: float = 1.00
+    BASE_BREAKEVEN_TRIGGER: float = 3.00  
+    BASE_BREAKEVEN_PROFIT: float = 1.50   
 
     MAX_PENDING_ORDER_MINUTES: int = 5
     BANCA_DEMO_INICIAL: float = 100.0
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
-
+    
     # LIMITE DE OPERAÇÕES SIMULTÂNEAS
     MAX_OPEN_TRADES: int = 5
     ALAVANCAGEM: int = 100
@@ -74,7 +76,6 @@ class Config:
     CORRELATION_THRESHOLD: float = 0.70
     MAX_TRADE_DURATION_MINUTES: int = 240
 
-    # VPS Contabo suporta 30 moedas com folga (6GB RAM)
     NUM_MOEDAS_OPERACIONAIS: int = 30
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5
@@ -84,11 +85,14 @@ class Config:
     NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
     _ATIVOS: List[str] = []
+    _ULTIMA_ATUALIZACAO: float = 0.0
 
     @classmethod
     def get_ativos(cls) -> List[str]:
-        if not cls._ATIVOS:
+        agora = time.time()
+        if not cls._ATIVOS or (agora - cls._ULTIMA_ATUALIZACAO) > 300:
             cls._ATIVOS = obter_melhores_moedas(cls.NUM_MOEDAS_OPERACIONAIS)
+            cls._ULTIMA_ATUALIZACAO = agora
         return cls._ATIVOS
 
     @classmethod
