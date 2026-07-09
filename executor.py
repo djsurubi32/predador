@@ -4,13 +4,15 @@ import asyncio
 import math
 import logging
 import time
-import sqlite3
+import json
+import aiosqlite
 import hashlib
 from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
 import ccxt
+import websockets
 from config import Config
 
 if sys.platform == 'win32':
@@ -38,11 +40,62 @@ class TelegramLogger:
     async def send(message: str):
         await asyncio.to_thread(TelegramLogger._send_sync, message)
 
+class BybitWebSocketManager:
+    def __init__(self, ccxt_symbols):
+        self.url = "wss://stream.bybit.com/v5/public/linear"
+        self.ccxt_symbols = ccxt_symbols
+        self.ticker_cache = {}
+        self.ccxt_to_bybit = {}
+        self.bybit_to_ccxt = {}
+        self._build_mappings()
+
+    def _build_mappings(self):
+        for sym in self.ccxt_symbols:
+            native = sym.split(':')[0].replace('/', '')
+            self.ccxt_to_bybit[sym] = native
+            self.bybit_to_ccxt[native] = sym
+            self.ticker_cache[sym] = {"last": 0.0, "bid": 0.0, "ask": 0.0}
+
+    async def start(self):
+        asyncio.create_task(self._loop())
+
+    async def _loop(self):
+        while True:
+            try:
+                async with websockets.connect(self.url, ping_interval=20, ping_timeout=10) as ws:
+                    args = [f"tickers.{self.ccxt_to_bybit[sym]}" for sym in self.ccxt_symbols]
+                    sub_msg = {"op": "subscribe", "args": args}
+                    await ws.send(json.dumps(sub_msg))
+
+                    while True:
+                        res = await ws.recv()
+                        data = json.loads(res)
+
+                        if "topic" in data and "data" in data:
+                            topic = data["topic"]
+                            native_symbol = topic.replace("tickers.", "")
+                            ccxt_symbol = self.bybit_to_ccxt.get(native_symbol)
+
+                            if ccxt_symbol:
+                                tick_info = data["data"]
+                                if "lastPrice" in tick_info and tick_info["lastPrice"]:
+                                    self.ticker_cache[ccxt_symbol]["last"] = float(tick_info["lastPrice"])
+                                if "bid1Price" in tick_info and tick_info["bid1Price"]:
+                                    self.ticker_cache[ccxt_symbol]["bid"] = float(tick_info["bid1Price"])
+                                if "ask1Price" in tick_info and tick_info["ask1Price"]:
+                                    self.ticker_cache[ccxt_symbol]["ask"] = float(tick_info["ask1Price"])
+            except Exception:
+                await asyncio.sleep(5)
+
+    def get_ticker(self, symbol):
+        return self.ticker_cache.get(symbol, {"last": 0.0, "bid": 0.0, "ask": 0.0})
+
 class BybitExecutionEngine:
-    def __init__(self, private_exchange=None, public_exchange=None, is_real_mode=True):
+    def __init__(self, private_exchange=None, public_exchange=None, is_real_mode=True, ws_manager=None):
         self.private_exchange = private_exchange
         self.public_exchange = public_exchange
         self.is_real_mode = is_real_mode
+        self.ws_manager = ws_manager
         self.last_equity_fetch = 0
         self.last_positions_fetch = 0
         self.equity_cache = Config.BANCA_DEMO_INICIAL
@@ -122,15 +175,13 @@ class BybitExecutionEngine:
                 open_trades = await db_reference.get_all_open_trades()
                 if not open_trades: return []
 
-                tickers = await asyncio.to_thread(self.public_exchange.fetch_tickers)
                 active = []
-
                 for t in open_trades:
                     symbol, side, entry, qty, open_time = t[0], t[1], float(t[2]), float(t[3]), float(t[4])
-                    ticker = tickers.get(symbol)
-                    if not ticker: continue
 
-                    current_price = float(ticker['last'] or ticker['close'] or entry)
+                    # Substituição Crítica: Coleta de preço de marcação via WebSocket Cache (Latência Zero)
+                    ws_tick = self.ws_manager.get_ticker(symbol)
+                    current_price = ws_tick["last"] if ws_tick["last"] > 0 else entry
 
                     if side.upper() == 'BUY':
                         unrealized_gross = (current_price - entry) * qty
@@ -173,8 +224,14 @@ class BybitExecutionEngine:
 
         for attempt in range(max_retries):
             try:
-                ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
-                limit_price = float(ticker['ask']) if order_side == 'sell' else float(ticker['bid'])
+                # Substituição Crítica: O Chase lê os melhores preços do livro direto do WebSocket, removendo rejeições por slippage
+                ws_tick = self.ws_manager.get_ticker(symbol)
+                if ws_tick["bid"] > 0 and ws_tick["ask"] > 0:
+                    limit_price = float(ws_tick["ask"]) if order_side == 'sell' else float(ws_tick["bid"])
+                else:
+                    ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
+                    limit_price = float(ticker['ask']) if order_side == 'sell' else float(ticker['bid'])
+
                 amount_str = self.private_exchange.amount_to_precision(symbol, remaining_amount)
                 price_str = self.private_exchange.price_to_precision(symbol, limit_price)
 
@@ -213,71 +270,50 @@ class BybitExecutionEngine:
 class Database:
     def __init__(self, db_name="predador_v31.db"):
         self.db_name = db_name
-        self._create_tables()
 
-    def _create_tables(self):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''CREATE TABLE IF NOT EXISTS trades (
+    async def inicializar(self):
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            await conn.execute('PRAGMA journal_mode=WAL;')
+            await conn.execute('''CREATE TABLE IF NOT EXISTS trades (
                 trade_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, entry REAL,
                 sl REAL, tp REAL, qty REAL, force INTEGER, open_time REAL)''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS elite_signals (
+            await conn.execute('''CREATE TABLE IF NOT EXISTS elite_signals (
                 symbol TEXT PRIMARY KEY, direction TEXT, price REAL, prob REAL,
                 score REAL, atr REAL, sma_atr REAL, funding REAL, reasoning TEXT,
                 timestamp REAL)''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS history (
+            await conn.execute('''CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT,
                 pnl REAL, outcome TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-            conn.commit()
-
-    def _get_elite_signals_sync(self):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT symbol, direction, price, prob, score, atr, sma_atr, funding, reasoning FROM elite_signals')
-            rows = cursor.fetchall()
-            return [{'symbol': r[0], 'direction': r[1], 'price': r[2], 'prob': r[3], 'score': r[4], 'current_atr': r[5], 'sma_atr': r[6], 'funding': r[7], 'reasoning': r[8]} for r in rows]
+            await conn.commit()
 
     async def get_elite_signals(self):
-        return await asyncio.to_thread(self._get_elite_signals_sync)
-
-    def _add_trade_sync(self, symbol, side, entry, sl, tp, qty, force):
-        trade_id = hashlib.sha256(f"{symbol}{side}{time.time():.4f}".encode()).hexdigest()[:16]
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''INSERT OR REPLACE INTO trades (trade_id, symbol, side, entry, sl, tp, qty, force, open_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', (trade_id, symbol, side, entry, sl, tp, qty, force, time.time()))
-            conn.commit()
-        return trade_id
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            async with conn.execute('SELECT symbol, direction, price, prob, score, atr, sma_atr, funding, reasoning FROM elite_signals') as cursor:
+                rows = await cursor.fetchall()
+                return [{'symbol': r[0], 'direction': r[1], 'price': r[2], 'prob': r[3], 'score': r[4], 'current_atr': r[5], 'sma_atr': r[6], 'funding': r[7], 'reasoning': r[8]} for r in rows]
 
     async def add_trade(self, symbol, side, entry, sl, tp, qty, force):
-        return await asyncio.to_thread(self._add_trade_sync, symbol, side, entry, sl, tp, qty, force)
-
-    def _get_all_open_trades_sync(self):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT symbol, side, entry, qty, open_time FROM trades')
-            return cursor.fetchall()
+        trade_id = hashlib.sha256(f"{symbol}{side}{time.time():.4f}".encode()).hexdigest()[:16]
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            await conn.execute('''INSERT OR REPLACE INTO trades (trade_id, symbol, side, entry, sl, tp, qty, force, open_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', (trade_id, symbol, side, entry, sl, tp, qty, force, time.time()))
+            await conn.commit()
+        return trade_id
 
     async def get_all_open_trades(self):
-        return await asyncio.to_thread(self._get_all_open_trades_sync)
-
-    def _remove_trade_sync(self, symbol):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM trades WHERE symbol = ?', (symbol,))
-            conn.commit()
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            async with conn.execute('SELECT symbol, side, entry, qty, open_time FROM trades') as cursor:
+                return await cursor.fetchall()
 
     async def remove_trade(self, symbol):
-        await asyncio.to_thread(self._remove_trade_sync, symbol)
-
-    def _add_history_sync(self, symbol, side, pnl, outcome):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO history (symbol, side, pnl, outcome) VALUES (?, ?, ?, ?)', (symbol, side, pnl, outcome))
-            conn.commit()
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            await conn.execute('DELETE FROM trades WHERE symbol = ?', (symbol,))
+            await conn.commit()
 
     async def add_history(self, symbol, side, pnl, outcome):
-        await asyncio.to_thread(self._add_history_sync, symbol, side, pnl, outcome)
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            await conn.execute('INSERT INTO history (symbol, side, pnl, outcome) VALUES (?, ?, ?, ?)', (symbol, side, pnl, outcome))
+            await conn.commit()
 
 class EngineExecutor:
     def __init__(self):
@@ -294,7 +330,8 @@ class EngineExecutor:
             except Exception as e:
                 logging.error(f"Erro nas credenciais: {e}")
 
-        self.execution = BybitExecutionEngine(private_exchange=self.private_exchange, public_exchange=self.public_exchange, is_real_mode=Config.OPERA_CONTA_REAL)
+        self.ws_manager = BybitWebSocketManager(Config.get_ativos())
+        self.execution = BybitExecutionEngine(private_exchange=self.private_exchange, public_exchange=self.public_exchange, is_real_mode=Config.OPERA_CONTA_REAL, ws_manager=self.ws_manager)
         self.db = Database()
         self.max_basket_pnl = 0.0
         self.last_global_status_time = time.time()
@@ -395,8 +432,6 @@ class EngineExecutor:
             return
 
         total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
-        total_gross_pnl = sum(float(p.get('grossPnl', 0)) for p in positions)
-        total_fees = sum(float(p.get('estimatedFee', 0)) for p in positions)
         total_margin = sum((float(p.get('contracts', 0)) * float(p.get('entryPrice', 0))) / Config.ALAVANCAGEM for p in positions)
 
         escala_multiplicador = total_margin / Config.BASE_BASKET_MARGIN if Config.BASE_BASKET_MARGIN != 0 else 1.0
@@ -478,13 +513,12 @@ class EngineExecutor:
             if len(open_symbols) >= Config.MAX_OPEN_TRADES: break
 
             direction = signal['direction']
-
             strategy = self.route_and_calculate_strategy(signal)
-
             amount_to_invest = strategy["invest_amount"]
 
-            ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
-            current_price = float(ticker.get('last') or ticker.get('close') or signal['price'])
+            # Substituição Crítica: O preço de abertura é derivado diretamente da memória do WebSocket
+            ws_tick = self.ws_manager.get_ticker(symbol)
+            current_price = ws_tick["last"] if ws_tick["last"] > 0 else signal['price']
 
             if current_price <= 0: continue
 
@@ -495,12 +529,14 @@ class EngineExecutor:
 
             try:
                 if Config.OPERA_CONTA_REAL:
-                    limit_price = float(ticker['bid']) if direction == 'BUY' else float(ticker['ask'])
+                    limit_price = float(ws_tick["bid"]) if direction == 'BUY' else float(ws_tick["ask"])
+                    if limit_price <= 0:
+                        ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
+                        limit_price = float(ticker['bid']) if direction == 'BUY' else float(ticker['ask'])
                     order = await self.execution.open_position_limit(symbol, direction, qty, limit_price)
                     if not order: continue
 
                 await self.db.add_trade(symbol, direction, current_price, sl_price, tp_price, qty, 1)
-
                 banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
 
                 modo_texto = "CONTA REAL" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO"
@@ -510,7 +546,6 @@ class EngineExecutor:
                 logging.info(f"Ordem aberta ({modo_texto}): {symbol} {direction} - Tipo: {strategy['lote_tipo']} - Preço: {current_price}")
 
                 open_symbols.add(symbol)
-
                 self.cooldown_memoria[symbol] = now + (60 * 60)
 
             except Exception as e:
@@ -518,7 +553,8 @@ class EngineExecutor:
 
     async def start_execution_loop(self):
         logging.info("🚀 PREDADOR QUANTITATIVO ONLINE")
-
+        await self.db.inicializar()
+        await self.ws_manager.start() # Inicializa o fluxo contínuo em paralelo no Executor
         await asyncio.to_thread(self.execution.init_markets_sync)
 
         modo = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO/DEMO 🔬"
