@@ -35,7 +35,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
 
     except Exception as e:
         logger.error(f"❌ Erro ao buscar moedas na Bybit: {e}. Acionando lista de segurança.")
-        return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT']
+        return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
 
 class Config:
     # CHAVES DE API E INTEGRAÇÕES
@@ -46,8 +46,8 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    # REGRAS FROUXAS PARA TESTE DE ESTRESSE
-    MIN_SCORE_ENTRY: float = 2.0
+    # FILTRO SEVERO ATIVADO
+    MIN_SCORE_ENTRY: float = 7.0
     OPERA_CONTA_REAL: bool = False
 
     BASE_TARGET_BASKET_PROFIT: float = 5.00
@@ -63,7 +63,9 @@ class Config:
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
-    MAX_OPEN_TRADES: int = 10
+
+    # LIMITE DE OPERAÇÕES SIMULTÂNEAS
+    MAX_OPEN_TRADES: int = 5
     ALAVANCAGEM: int = 100
 
     BARRIER_HORIZON: int = 20
@@ -72,7 +74,8 @@ class Config:
     CORRELATION_THRESHOLD: float = 0.70
     MAX_TRADE_DURATION_MINUTES: int = 240
 
-    NUM_MOEDAS_OPERACIONAIS: int = 100
+    # VPS Contabo suporta 30 moedas com folga (6GB RAM)
+    NUM_MOEDAS_OPERACIONAIS: int = 30
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5
     TIMEFRAME: str = '15m'
