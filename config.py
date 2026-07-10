@@ -67,7 +67,7 @@ class Config:
     MAX_POSITION_RISK: float = 0.045
 
     # LIMITE DE OPERAÇÕES SIMULTÂNEAS REDUZIDO
-    MAX_OPEN_TRADES: int = 4
+    MAX_OPEN_TRADES: int = 7
     ALAVANCAGEM: int = 100
 
     BARRIER_HORIZON: int = 20
