@@ -413,7 +413,7 @@ class EngineExecutor:
         if total_net_pnl > self.max_basket_pnl:
             self.max_basket_pnl = total_net_pnl
 
-           breakeven_ativo = False
+        breakeven_ativo = False
         if self.max_basket_pnl >= gatilho_breakeven:
             lucro_excedente = self.max_basket_pnl - gatilho_breakeven
             degraus_avancados = math.floor(lucro_excedente / passo_avanco)
