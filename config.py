@@ -33,7 +33,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
 
         logger.info(f"✅ Universo rotativo atualizado! As {len(top_ativos)} moedas mais quentes agora estão no radar.")
         return top_ativos
-        
+
     except Exception as e:
         logger.error(f"❌ Erro ao buscar moedas na Bybit: {e}. Acionando lista de segurança.")
         return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
@@ -46,24 +46,23 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    MIN_SCORE_ENTRY: float = 7.0  
-    OPERA_CONTA_REAL: bool = False 
+    MIN_SCORE_ENTRY: float = 7.0
+    OPERA_CONTA_REAL: bool = False
 
-    # GESTÃO MATEMÁTICA DO BALDE: TOP 3 ACELERADO
-    BASE_TARGET_BASKET_PROFIT: float = 6.00
-    BASE_BASKET_TRAILING_PULLBACK: float = 1.00
-    BASE_STOP_BASKET_LOSS: float = -8.00
-    BASE_BASKET_MARGIN: float = -12.00
+    # GESTÃO MATEMÁTICA PERCENTUAL PROPORCIONAL
+    BASKET_TARGET_PCT: float = 1.50          # 150% do valor alocado
+    BASKET_TRAILING_PULLBACK_PCT: float = 0.50 # 50% de recuo tolerado do alvo
+    BASKET_STOP_LOSS_PCT: float = -0.75      # -75% do valor alocado
 
-    BASE_BREAKEVEN_TRIGGER: float = 2.50  
-    BASE_BREAKEVEN_PROFIT: float = 1.00   
+    BASKET_BREAKEVEN_TRIGGER_PCT: float = 0.75 # Ativa proteção aos 75%
+    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.50  # Garante 50% na ativação
 
     MAX_PENDING_ORDER_MINUTES: int = 5
     BANCA_DEMO_INICIAL: float = 100.0
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
-    
+
     # FOCO NA ELITE: 3 VAGAS
     MAX_OPEN_TRADES: int = 3
     ALAVANCAGEM: int = 100
