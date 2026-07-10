@@ -33,13 +33,12 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
 
         logger.info(f"✅ Universo rotativo atualizado! As {len(top_ativos)} moedas mais quentes agora estão no radar.")
         return top_ativos
-
+        
     except Exception as e:
         logger.error(f"❌ Erro ao buscar moedas na Bybit: {e}. Acionando lista de segurança.")
         return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
 
 class Config:
-    # CHAVES DE API E INTEGRAÇÕES
     BYBIT_API_KEY: str = os.getenv("BYBIT_API_KEY", "")
     BYBIT_SECRET: str = os.getenv("BYBIT_SECRET", "")
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
@@ -47,27 +46,26 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    # FILTRO SEVERO ATIVADO
-    MIN_SCORE_ENTRY: float = 7.0
-    OPERA_CONTA_REAL: bool = False
+    MIN_SCORE_ENTRY: float = 7.0  
+    OPERA_CONTA_REAL: bool = False 
 
-    # GESTÃO MATEMÁTICA DO BALDE DESPRESSURIZADO
-    BASE_TARGET_BASKET_PROFIT: float = 4.00
-    BASE_BASKET_TRAILING_PULLBACK: float = 0.80
-    BASE_STOP_BASKET_LOSS: float = -5.00
-    BASE_BASKET_MARGIN: float = -7.00
+    # GESTÃO MATEMÁTICA DO BALDE: TOP 3 ACELERADO
+    BASE_TARGET_BASKET_PROFIT: float = 6.00
+    BASE_BASKET_TRAILING_PULLBACK: float = 1.00
+    BASE_STOP_BASKET_LOSS: float = -8.00
+    BASE_BASKET_MARGIN: float = -12.00
 
-    BASE_BREAKEVEN_TRIGGER: float = 2.00
-    BASE_BREAKEVEN_PROFIT: float = 1.00
+    BASE_BREAKEVEN_TRIGGER: float = 2.50  
+    BASE_BREAKEVEN_PROFIT: float = 1.00   
 
     MAX_PENDING_ORDER_MINUTES: int = 5
     BANCA_DEMO_INICIAL: float = 100.0
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
-
-    # LIMITE DE OPERAÇÕES SIMULTÂNEAS REDUZIDO
-    MAX_OPEN_TRADES: int = 7
+    
+    # FOCO NA ELITE: 3 VAGAS
+    MAX_OPEN_TRADES: int = 3
     ALAVANCAGEM: int = 100
 
     BARRIER_HORIZON: int = 20
