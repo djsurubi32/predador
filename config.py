@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 def obter_melhores_moedas(limite: int = 30) -> List[str]:
-    logger.info(f"🔄 Conectando à Bybit para buscar o Top {limite} de criptomoedas mais negociadas...")
+    logger.info(f"🔄 Conectando à Bybit para buscar o Top {limite} de criptomoedas blindadas e líquidas...")
     try:
         exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
         exchange.load_markets()
@@ -25,18 +25,31 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
         for symbol, ticker in tickers.items():
             market = exchange.markets.get(symbol)
             if market and market.get('linear') and market.get('quote') == 'USDT' and market.get('active'):
+                
                 volume_24h = float(ticker.get('quoteVolume', 0) or 0)
-                moedas_validas.append((symbol, volume_24h))
+                bid = float(ticker.get('bid', 0) or 0)
+                ask = float(ticker.get('ask', 0) or 0)
+                
+                # BLINDAGEM INSTITUCIONAL
+                # 1. Rejeita moedas com Bid/Ask zerados ou falhas no book
+                if bid > 0 and ask > 0:
+                    
+                    # 2. Spread (Distância Bid/Ask) máximo de 0.05% (Evita Derrapagem / Slippage)
+                    spread_pct = ((ask - bid) / bid) * 100
+                    
+                    # 3. Volume mínimo de 30 milhões de dólares nas últimas 24h
+                    if spread_pct <= 0.05 and volume_24h >= 30000000:
+                        moedas_validas.append((symbol, volume_24h))
 
         moedas_validas.sort(key=lambda x: x[1], reverse=True)
         top_ativos = [x[0] for x in moedas_validas[:limite]]
 
-        logger.info(f"✅ Universo rotativo atualizado! As {len(top_ativos)} moedas mais quentes agora estão no radar.")
+        logger.info(f"✅ Universo atualizado! {len(top_ativos)} moedas ultra-líquidas e sem risco de derrapagem detectadas.")
         return top_ativos
-
+        
     except Exception as e:
-        logger.error(f"❌ Erro ao buscar moedas na Bybit: {e}. Acionando lista de segurança.")
-        return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
+        logger.error(f"❌ Erro ao buscar moedas na Bybit: {e}. Acionando lista de segurança institucional.")
+        return ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 'BNB/USDT:USDT']
 
 class Config:
     BYBIT_API_KEY: str = os.getenv("BYBIT_API_KEY", "")
@@ -46,24 +59,22 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    MIN_SCORE_ENTRY: float = 7.0
-    OPERA_CONTA_REAL: bool = False
+    MIN_SCORE_ENTRY: float = 7.0  
+    OPERA_CONTA_REAL: bool = False 
 
-    # GESTÃO MATEMÁTICA PERCENTUAL PROPORCIONAL
-    BASKET_TARGET_PCT: float = 1.50          # 150% do valor alocado
-    BASKET_TRAILING_PULLBACK_PCT: float = 0.50 # 50% de recuo tolerado do alvo
-    BASKET_STOP_LOSS_PCT: float = -0.75      # -75% do valor alocado
-
-    BASKET_BREAKEVEN_TRIGGER_PCT: float = 0.75 # Ativa proteção aos 75%
-    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.50  # Garante 50% na ativação
+    BASKET_TARGET_PCT: float = 1.50          
+    BASKET_TRAILING_PULLBACK_PCT: float = 0.50 
+    BASKET_STOP_LOSS_PCT: float = -0.75      
+    
+    BASKET_BREAKEVEN_TRIGGER_PCT: float = 0.75 
+    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.50  
 
     MAX_PENDING_ORDER_MINUTES: int = 5
     BANCA_DEMO_INICIAL: float = 100.0
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
-
-    # FOCO NA ELITE: 3 VAGAS
+    
     MAX_OPEN_TRADES: int = 3
     ALAVANCAGEM: int = 100
 
@@ -73,7 +84,7 @@ class Config:
     CORRELATION_THRESHOLD: float = 0.70
     MAX_TRADE_DURATION_MINUTES: int = 240
 
-    NUM_MOEDAS_OPERACIONAIS: int = 100
+    NUM_MOEDAS_OPERACIONAIS: int = 30
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5
     TIMEFRAME: str = '15m'
