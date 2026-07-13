@@ -1,45 +1,61 @@
+import sys
+import os
 import time
 import logging
-from threading import Thread
 import asyncio
+import threading
+import ccxt
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Importa o escudo anti-crash (Healthcheck do Railway)
-from keep_alive import keep_alive 
-
-# Importa os motores do ecossistema quantitativo
-from treinador import main as iniciar_treinador
-from analisador import RadarCore
+from config import Config
+from analisador import iniciar_motores_ia
 from executor import EngineExecutor
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [MAIN] - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-def rodar_treinador():
-    logging.info("A iniciar a thread do Treinador de IA...")
-    iniciar_treinador()
+# Escudo Anti-Crash (Keep-Alive)
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Predador Quantitativo Online")
 
-def rodar_analisador():
-    logging.info("A iniciar a thread do Analisador (Radar)...")
-    asyncio.run(RadarCore().scan_market())
+    def log_message(self, format, *args):
+        # Desativa o log de requisições web para não poluir o terminal
+        pass
 
-def rodar_executor():
-    logging.info("A iniciar a thread do Executor de Ordens...")
-    asyncio.run(EngineExecutor().start_execution_loop())
+def run_keep_alive():
+    try:
+        server = HTTPServer(('0.0.0.0', 8080), KeepAliveHandler)
+        logging.info("🛡️ Escudo Anti-Crash (Healthcheck) ativado na porta 8080")
+        server.serve_forever()
+    except Exception as e:
+        logging.error(f"Erro no Escudo Anti-Crash: {e}")
 
-if __name__ == "__main__":
-    # 1. ATIVA A FANTASIA DE SITE PARA ENGANAR O RAILWAY
+def main():
     logging.info("A ativar o Escudo Anti-Crash (Keep-Alive)...")
-    keep_alive()
-    
-    # 2. Inicia os motores do robô em paralelo
-    Thread(target=rodar_treinador, daemon=True).start()
-    
-    # Pausa de 5 segundos para garantir que o Treinador crie as pastas e carregue a memória
-    time.sleep(5)
-    
-    Thread(target=rodar_analisador, daemon=True).start()
-    
-    # Pausa de 2 segundos para evitar sobrecarga de arranque
-    time.sleep(2)
-    
-    # O executor mantém o loop principal vivo na thread primária
-    rodar_executor()
+    threading.Thread(target=run_keep_alive, daemon=True, name="Thread-KeepAlive").start()
+
+    # 1. Inicializa a conexão pública da corretora para a IA estudar os gráficos
+    public_exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+
+    # 2. Dispara a nova arquitetura do Analisador (Treinador + Radar em paralelo)
+    iniciar_motores_ia(public_exchange)
+
+    # 3. Pequena pausa para garantir que os modelos de IA e o banco de dados carreguem
+    time.sleep(3)
+
+    # 4. Inicia o Executor de Ordens no loop principal do sistema
+    logging.info("A iniciar a thread do Executor de Ordens...")
+    executor = EngineExecutor()
+    try:
+        asyncio.run(executor.start_execution_loop())
+    except KeyboardInterrupt:
+        logging.info("🛑 Executor encerrado pelo usuário.")
+
+if __name__ == '__main__':
+    # Otimização de plataforma para Windows (se rodar fora da VPS)
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    main()

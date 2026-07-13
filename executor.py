@@ -297,7 +297,6 @@ class EngineExecutor:
         self.execution = BybitExecutionEngine(private_exchange=self.private_exchange, public_exchange=self.public_exchange, is_real_mode=Config.OPERA_CONTA_REAL)
         self.db = Database()
 
-        # Variáveis de monitoramento
         self.max_basket_pnl = 0.0
         self.min_basket_pnl = 0.0
         self.last_global_status_time = time.time()
@@ -347,6 +346,46 @@ class EngineExecutor:
             "sl_factor": 0.988
         }
 
+    async def check_btc_trend_1h(self) -> str:
+        try:
+            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, 'BTC/USDT:USDT', '1h', limit=20)
+            if not candles or len(candles) < 20:
+                return "NEUTRAL"
+            closes = [float(c[4]) for c in candles]
+            sma = sum(closes) / len(closes)
+            current_price = closes[-1]
+            if current_price > sma: return "BULLISH"
+            elif current_price < sma: return "BEARISH"
+            return "NEUTRAL"
+        except Exception as e:
+            logging.error(f"Erro ao checar tendência macro do BTC (1h): {e}")
+            return "NEUTRAL"
+
+    async def check_asset_trend_4h(self, symbol: str) -> str:
+        try:
+            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '4h', limit=20)
+            if not candles or len(candles) < 20:
+                return "NEUTRAL"
+            closes = [float(c[4]) for c in candles]
+            sma = sum(closes) / len(closes)
+            current_price = closes[-1]
+            if current_price > sma: return "BULLISH"
+            elif current_price < sma: return "BEARISH"
+            return "NEUTRAL"
+        except Exception as e:
+            logging.error(f"Erro ao checar timeframe macro 4h para {symbol}: {e}")
+            return "NEUTRAL"
+
+    async def check_open_interest_healthy(self, symbol: str) -> bool:
+        try:
+            oi_data = await asyncio.to_thread(self.public_exchange.fetch_open_interest, symbol)
+            if oi_data and len(oi_data) > 0:
+                oi_value = float(oi_data[0].get('openInterestAmount', 0) or 0)
+                return oi_value > 0
+            return True
+        except Exception:
+            return True
+
     async def reconcile_positions(self):
         if not Config.OPERA_CONTA_REAL: return
         try:
@@ -394,7 +433,7 @@ class EngineExecutor:
         if not positions:
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
-            self.last_summary_time = now  # Reseta o timer de resumo enquanto vazio
+            self.last_summary_time = now
             if now - self.last_empty_heartbeat > 60:
                 logging.info("⚖️ Balde vazio. Aguardando oportunidades das vertentes...")
                 self.last_empty_heartbeat = now
@@ -405,7 +444,6 @@ class EngineExecutor:
 
         if total_margin <= 0: return
 
-        # MATEMÁTICA PROPORCIONAL
         alvo_dinamico = total_margin * Config.BASKET_TARGET_PCT
         pullback_dinamico = total_margin * Config.BASKET_TRAILING_PULLBACK_PCT
         stop_dinamico = total_margin * Config.BASKET_STOP_LOSS_PCT
@@ -414,7 +452,6 @@ class EngineExecutor:
         lucro_garantido_breakeven = total_margin * Config.BASKET_BREAKEVEN_PROFIT_PCT
         passo_avanco = total_margin * 0.25
 
-        # Atualização de topos e fundos do balde
         if total_net_pnl > self.max_basket_pnl:
             self.max_basket_pnl = total_net_pnl
         if total_net_pnl < self.min_basket_pnl:
@@ -442,7 +479,6 @@ class EngineExecutor:
             acao = "FECHAR_TUDO"
             motivo = f"🎯 TRAILING GLOBAL ATIVADO [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\nEsvaziando balde adaptativo.\nResultado LÍQUIDO líquido: ${lucro_final:.2f}"
 
-        # Lógica de Fechamento
         if acao == "FECHAR_TUDO":
             if not Config.OPERA_CONTA_REAL:
                 self.simulated_banca += lucro_final
@@ -466,7 +502,6 @@ class EngineExecutor:
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
 
-        # Lógica do Raio-X de 10 minutos (Somente se nenhuma ação de fechamento ocorreu)
         elif acao is None and (now - self.last_summary_time >= 600):
             self.last_summary_time = now
             modo_texto = "CONTA REAL" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO"
@@ -495,6 +530,10 @@ class EngineExecutor:
         if len(open_symbols) >= Config.MAX_OPEN_TRADES: return
 
         now = time.time()
+
+        # Mapeia a direção do BTC uma única vez no ciclo para otimizar requisições
+        btc_trend = await self.check_btc_trend_1h()
+
         for signal in signals:
             symbol = signal['symbol']
 
@@ -507,8 +546,30 @@ class EngineExecutor:
 
             direction = signal['direction']
 
-            strategy = self.route_and_calculate_strategy(signal)
+            # FILTRO 1: BÚSSOLA DIRECIONAL DO BITCOIN (1h)
+            if direction == 'BUY' and btc_trend == 'BEARISH':
+                logging.info(f"🚫 [FILTRO BTC] Compra em {symbol} descartada (BTC em tendência de QUEDA no 1h).")
+                continue
+            if direction == 'SELL' and btc_trend == 'BULLISH':
+                logging.info(f"🚫 [FILTRO BTC] Venda em {symbol} descartada (BTC em tendência de ALTA no 1h).")
+                continue
 
+            # FILTRO 2: ALINHAMENTO DE MÚLTIPLOS TIMEFRAMES (4h)
+            asset_trend_4h = await self.check_asset_trend_4h(symbol)
+            if direction == 'BUY' and asset_trend_4h == 'BEARISH':
+                logging.info(f"🚫 [FILTRO 4H] Compra em {symbol} descartada (Timeframe macro 4h é de QUEDA).")
+                continue
+            if direction == 'SELL' and asset_trend_4h == 'BULLISH':
+                logging.info(f"🚫 [FILTRO 4H] Venda em {symbol} descartada (Timeframe macro 4h é de ALTA).")
+                continue
+
+            # FILTRO 3: VALIDAÇÃO DE LIQUIDEZ POR OPEN INTEREST
+            oi_healthy = await self.check_open_interest_healthy(symbol)
+            if not oi_healthy:
+                logging.info(f"🚫 [FILTRO OI] Ordem em {symbol} abortada. Sem volume de Open Interest institucional ativo.")
+                continue
+
+            strategy = self.route_and_calculate_strategy(signal)
             amount_to_invest = strategy["invest_amount"]
 
             ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
@@ -527,11 +588,9 @@ class EngineExecutor:
                     order = await self.execution.open_position_limit(symbol, direction, qty, limit_price)
                     if not order: continue
 
-                # Adiciona o trade no banco de dados
                 await self.db.add_trade(symbol, direction, current_price, sl_price, tp_price, qty, 1)
                 open_symbols.add(symbol)
 
-                # Recalcula a margem total instantânea para mostrar no alerta do Telegram
                 open_trades_after = await self.db.get_all_open_trades()
                 total_margin = sum((float(t[3]) * float(t[2])) / Config.ALAVANCAGEM for t in open_trades_after)
                 alvo_atual = total_margin * Config.BASKET_TARGET_PCT
