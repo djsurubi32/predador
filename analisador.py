@@ -1,10 +1,10 @@
 import os
 import sys
 import time
-import asyncio
 import logging
 import sqlite3
 import threading
+import asyncio
 from typing import List, Tuple, Dict, Any
 
 import numpy as np
@@ -74,7 +74,6 @@ class TreinadorIA:
             return pd.DataFrame()
 
     def preparar_dataset(self, symbol: str) -> pd.DataFrame:
-        # Descarrega os múltiplos timeframes
         df_15m = self.obter_historico(symbol, '15m', Config.CANDLES_TREINAMENTO_ML)
         df_1h = self.obter_historico(symbol, '1h', int(Config.CANDLES_TREINAMENTO_ML / 4))
         df_4h = self.obter_historico(symbol, '4h', int(Config.CANDLES_TREINAMENTO_ML / 16))
@@ -82,27 +81,21 @@ class TreinadorIA:
         if df_15m.empty or df_1h.empty or df_4h.empty:
             return pd.DataFrame()
 
-        # Calcula os indicadores específicos de cada timeframe
         df_15m = IndicadoresMao.calcular_15m(df_15m)
         df_1h = IndicadoresMao.calcular_macro(df_1h, '1h')
         df_4h = IndicadoresMao.calcular_macro(df_4h, '4h')
 
-        # Ordena por timestamp para garantir o alinhamento correto com o merge_asof
         df_15m = df_15m.sort_values('timestamp')
         df_1h = df_1h.sort_values('timestamp')
         df_4h = df_4h.sort_values('timestamp')
 
-        # Filtra colunas do macro para evitar duplicações de colunas genéricas
         cols_1h = ['timestamp', 'rsi_1h', 'sma_trend_1h']
         cols_4h = ['timestamp', 'rsi_4h', 'sma_trend_4h']
 
-        # Fusão dos dados direcionados para trás (Evita olhar para o futuro)
         df_merged = pd.merge_asof(df_15m, df_1h[cols_1h], on='timestamp', direction='backward')
         df_merged = pd.merge_asof(df_merged, df_4h[cols_4h], on='timestamp', direction='backward')
 
-        # Define o Target de Classificação (1 se o preço subiu nas próximas 4 velas de 15m, 0 caso contrário)
         df_merged['target'] = (df_merged['close'].shift(-4) > df_merged['close']).astype(int)
-
         return df_merged
 
     def treinar_modelo_ativo(self, symbol: str):
@@ -117,7 +110,6 @@ class TreinadorIA:
         X = df_clean[features]
         y = df_clean['target']
 
-        # Separação sequencial (Séries temporais não podem usar shuffle=True)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, shuffle=False)
 
         model = LGBMClassifier(
@@ -131,7 +123,6 @@ class TreinadorIA:
 
         try:
             model.fit(X_train, y_train)
-
             os.makedirs(Config.MODELS_DIR, exist_ok=True)
             model_name = symbol.replace('/', '_').replace(':', '_')
             model_path = os.path.join(Config.MODELS_DIR, f"model_{model_name}.pkl")
@@ -202,21 +193,16 @@ class AnalisadorRadar:
 
         latest_row = df.iloc[-1]
 
-        # Proteção contra NaNs de indicadores não preenchidos no final
         features = ['rsi', 'atr', 'vwap_dev', 'rsi_1h', 'sma_trend_1h', 'rsi_4h', 'sma_trend_4h']
         if latest_row[features].isna().any():
             return
 
         try:
             model = joblib.load(model_path)
-
-            # Vetor de entrada para predição
             input_data = pd.DataFrame([latest_row[features]], columns=features)
 
-            # Probabilidade do preço subir (Classe 1)
             prob_up = float(model.predict_proba(input_data)[0][1])
 
-            # Determinação de Direção por Probabilidade Extrema
             direction = None
             prob_final = 0.0
 
@@ -231,12 +217,30 @@ class AnalisadorRadar:
                 score = round(prob_final * 10, 1)
 
                 if score >= Config.MIN_SCORE_ENTRY:
-                    # Envia o sinal qualificado para o banco de dados
+
+                    # Cálculo Dinâmico do Espaço VWAP
                     pnl_dev_vwap = latest_row['vwap_dev'] * 100
+                    abs_dev = abs(pnl_dev_vwap)
+                    if abs_dev < 0.5:
+                        espaco_score = 3.0
+                    elif abs_dev < 1.5:
+                        espaco_score = 2.0
+                    else:
+                        espaco_score = 1.0
+
+                    # Cálculo Dinâmico de Fluxo Institucional (Força RSI)
+                    rsi_atual = latest_row['rsi']
+                    if rsi_atual > 65 or rsi_atual < 35:
+                        fluxo_score = 3.0
+                    elif rsi_atual > 55 or rsi_atual < 45:
+                        fluxo_score = 2.0
+                    else:
+                        fluxo_score = 1.0
 
                     reasoning = (
                         f"ML_Dir:{score:.1f} | "
-                        f"ML_Espaço:3.0({pnl_dev_vwap:.1f}%) | "
+                        f"ML_Espaço:{espaco_score:.1f}({pnl_dev_vwap:.1f}%) | "
+                        f"Fluxo:{fluxo_score:.1f} | "
                         f"Macro1h:{'Bull' if latest_row['sma_trend_1h'] == 1 else 'Bear'} | "
                         f"Macro4h:{'Bull' if latest_row['sma_trend_4h'] == 1 else 'Bear'}"
                     )
@@ -279,14 +283,13 @@ class AnalisadorRadar:
                 await self.limpar_sinais_db()
                 ativos = Config.get_ativos()
 
-                # Executa a análise em fila sequencial com respiro para evitar o bloqueio da corretora
                 for symbol in ativos:
                     await self.analisador_ativo_safe(symbol)
-                    await asyncio.sleep(1.5) # Pausa estratégica de 1.5 segundos entre cada moeda
+                    await asyncio.sleep(1.5)
 
             except Exception as e:
                 logging.error(f"Erro no loop principal do radar: {e}")
-            await asyncio.sleep(60) # Varre o mercado a cada 1 minuto
+            await asyncio.sleep(60)
 
     async def analisador_ativo_safe(self, symbol: str):
         try:
@@ -294,17 +297,14 @@ class AnalisadorRadar:
         except Exception as e:
             logging.error(f"Falha segura ao processar {symbol} no radar: {e}")
 
-# Lógica de Inicialização de Threads para o main.py
 def iniciar_motores_ia(public_exchange: ccxt.bybit):
     treinador = TreinadorIA(public_exchange)
     radar = AnalisadorRadar(public_exchange)
 
-    # Thread 1: Treinamento contínuo em segundo plano (Não trava o bot)
     t_treino = threading.Thread(target=treinador.loop_treinador, daemon=True, name="Thread-Treinador-IA")
     t_treino.start()
     logging.info("A iniciar a thread do Treinador de IA...")
 
-    # Thread 2: Radar de Varredura de Sinais em Tempo Real
     def start_radar_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
