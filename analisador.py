@@ -273,15 +273,16 @@ class AnalisadorRadar:
             pass
 
     async def loop_radar(self):
-        logging.info("📡 Radar inicializado com Isolamento Multiprocessado.")
+        logging.info("📡 Radar inicializado com Isolamento Multiprocessado (Fila Sequencial Anti-Ban).")
         while True:
             try:
                 await self.limpar_sinais_db()
                 ativos = Config.get_ativos()
 
-                # Executa a análise de todo o lote em paralelo (GIL-Free)
-                tarefas = [self.analisador_ativo_safe(symbol) for symbol in ativos]
-                await asyncio.gather(*tarefas)
+                # Executa a análise em fila sequencial com respiro para evitar o bloqueio da corretora
+                for symbol in ativos:
+                    await self.analisador_ativo_safe(symbol)
+                    await asyncio.sleep(1.5) # Pausa estratégica de 1.5 segundos entre cada moeda
 
             except Exception as e:
                 logging.error(f"Erro no loop principal do radar: {e}")
