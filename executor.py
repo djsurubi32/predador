@@ -311,6 +311,13 @@ class EngineExecutor:
         self.cooldown_memoria = {}
         self.simulated_banca = float(Config.BANCA_DEMO_INICIAL)
 
+        # 🛡️ AJUSTE MATEMÁTICO INSTITUCIONAL: Cálculo das frações transferido para o construtor (Escopo Global da Classe)
+        self.f_target = Config.BASKET_TARGET_PCT / 100.0 if Config.BASKET_TARGET_PCT >= 0.05 else Config.BASKET_TARGET_PCT
+        self.f_pullback = Config.BASKET_TRAILING_PULLBACK_PCT / 100.0 if Config.BASKET_TRAILING_PULLBACK_PCT >= 0.05 else Config.BASKET_TRAILING_PULLBACK_PCT
+        self.f_stop = Config.BASKET_STOP_LOSS_PCT / 100.0 if abs(Config.BASKET_STOP_LOSS_PCT) >= 0.05 else Config.BASKET_STOP_LOSS_PCT
+        self.f_breakeven_trigger = Config.BASKET_BREAKEVEN_TRIGGER_PCT / 100.0 if Config.BASKET_BREAKEVEN_TRIGGER_PCT >= 0.05 else Config.BASKET_BREAKEVEN_TRIGGER_PCT
+        self.f_breakeven_profit = Config.BASKET_BREAKEVEN_PROFIT_PCT / 100.0 if Config.BASKET_BREAKEVEN_PROFIT_PCT >= 0.05 else Config.BASKET_BREAKEVEN_PROFIT_PCT
+
     def route_and_calculate_strategy(self, opp):
         score = float(opp['score'])
         prob = float(opp['prob'])
@@ -382,10 +389,9 @@ class EngineExecutor:
             logging.error(f"Erro ao checar timeframe macro 4h para {symbol}: {e}")
             return "NEUTRAL"
 
-    # 🛡️ NOVO REQUISITO INSTITUCIONAL: Validação estrita de timeframe de 1h da moeda
     async def check_asset_trend_1h(self, symbol: str) -> str:
         try:
-            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '1h', limit=20)
+            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, '1h', limit=20)
             if not candles or len(candles) < 20:
                 return "NEUTRAL"
             closes = [float(c[4]) for c in candles]
@@ -466,20 +472,14 @@ class EngineExecutor:
 
         if total_margin <= 0: return
 
-        # 🛡️ AJUSTE MATEMÁTICO INSTITUCIONAL: Tratamento dinâmico de porcentagem (valores inteiros para decimais reais)
-        f_target = Config.BASKET_TARGET_PCT / 100.0 if Config.BASKET_TARGET_PCT >= 0.05 else Config.BASKET_TARGET_PCT
-        f_pullback = Config.BASKET_TRAILING_PULLBACK_PCT / 100.0 if Config.BASKET_TRAILING_PULLBACK_PCT >= 0.05 else Config.BASKET_TRAILING_PULLBACK_PCT
-        f_stop = Config.BASKET_STOP_LOSS_PCT / 100.0 if abs(Config.BASKET_STOP_LOSS_PCT) >= 0.05 else Config.BASKET_STOP_LOSS_PCT
-        f_breakeven_trigger = Config.BASKET_BREAKEVEN_TRIGGER_PCT / 100.0 if Config.BASKET_BREAKEVEN_TRIGGER_PCT >= 0.05 else Config.BASKET_BREAKEVEN_TRIGGER_PCT
-        f_breakeven_profit = Config.BASKET_BREAKEVEN_PROFIT_PCT / 100.0 if Config.BASKET_BREAKEVEN_PROFIT_PCT >= 0.05 else Config.BASKET_BREAKEVEN_PROFIT_PCT
+        # Utilizando as variáveis de conversão instanciadas globalmente na classe
+        alvo_dinamico = total_margin * self.f_target
+        pullback_dinamico = total_margin * self.f_pullback
+        stop_dinamico = total_margin * self.f_stop
 
-        alvo_dinamico = total_margin * f_target
-        pullback_dinamico = total_margin * f_pullback
-        stop_dinamico = total_margin * f_stop # f_stop já traz o sinal negativo correto
-
-        gatilho_breakeven = total_margin * f_breakeven_trigger
-        lucro_garantido_breakeven = total_margin * f_breakeven_profit
-        passo_avanco = total_margin * 0.0025 # degraus elásticos de 0.25% de margem
+        gatilho_breakeven = total_margin * self.f_breakeven_trigger
+        lucro_garantido_breakeven = total_margin * self.f_breakeven_profit
+        passo_avanco = total_margin * 0.0025
 
         if total_net_pnl > self.max_basket_pnl:
             self.max_basket_pnl = total_net_pnl
@@ -490,7 +490,7 @@ class EngineExecutor:
         if self.max_basket_pnl >= gatilho_breakeven:
             lucro_excedente = self.max_basket_pnl - gatilho_breakeven
             degraus_avancados = math.floor(lucro_excedente / passo_avanco) if passo_avanco > 0 else 0
-            stop_dinamico = lucro_garantido_breakeven + (degraus_avancados * (total_margin * 0.00125)) # garante mais 0.125% de lucro por degrau
+            stop_dinamico = lucro_garantido_breakeven + (degraus_avancados * (total_margin * 0.00125))
             breakeven_ativo = True
 
         acao = None
@@ -561,12 +561,9 @@ class EngineExecutor:
         positions = await self.execution.get_current_positions(self.db)
         now = time.time()
 
-        # 🛡️ TRAVA DE ANTI-CORRELAÇÃO DE MARGEM (ANTI-SUICÍDIO)
-        # Conta a direção das posições ativas de forma rigorosa
         buy_positions_count = sum(1 for p in positions if p['side'] in ['LONG', 'BUY'])
         sell_positions_count = sum(1 for p in positions if p['side'] in ['SHORT', 'SELL'])
 
-        # Mapeia a direção do BTC uma única vez no ciclo para otimizar requisições
         btc_trend = await self.check_btc_trend_1h()
 
         for signal in signals:
@@ -581,7 +578,6 @@ class EngineExecutor:
 
             direction = signal['direction']
 
-            # 🛡️ VALIDAÇÃO DA TRAVA ANTI-SUICÍDIO (MÁXIMO 3 NA MESMA DIREÇÃO NO BALDE)
             if direction == 'BUY' and buy_positions_count >= 3:
                 logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Compra de {symbol} bloqueada. Limite direcional atingido (já existem {buy_positions_count} posições BUY no balde).")
                 continue
@@ -589,7 +585,6 @@ class EngineExecutor:
                 logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Venda de {symbol} bloqueada. Limite direcional atingido (já existem {sell_positions_count} posições SELL no balde).")
                 continue
 
-            # FILTRO 1: BÚSSOLA DIRECIONAL DO BITCOIN (1h)
             if direction == 'BUY' and btc_trend == 'BEARISH':
                 logging.info(f"🚫 [FILTRO BTC] Compra em {symbol} descartada (BTC em tendência de QUEDA no 1h).")
                 continue
@@ -597,7 +592,6 @@ class EngineExecutor:
                 logging.info(f"🚫 [FILTRO BTC] Venda em {symbol} descartada (BTC em tendência de ALTA no 1h).")
                 continue
 
-            # FILTRO 2: ALINHAMENTO DE MÚLTIPLOS TIMEFRAMES (4h)
             asset_trend_4h = await self.check_asset_trend_4h(symbol)
             if direction == 'BUY' and asset_trend_4h == 'BEARISH':
                 logging.info(f"🚫 [FILTRO 4H] Compra em {symbol} descartada (Timeframe macro 4h é de QUEDA).")
@@ -606,7 +600,6 @@ class EngineExecutor:
                 logging.info(f"🚫 [FILTRO 4H] Venda em {symbol} descartada (Timeframe macro 4h é de ALTA).")
                 continue
 
-            # 🛡️ FILTRO 2B: ALINHAMENTO DE TIMEFRAME 1H ESTRITO (DA PRÓPRIA MOEDA)
             asset_trend_1h = await self.check_asset_trend_1h(symbol)
             if direction == 'BUY' and asset_trend_1h == 'BEARISH':
                 logging.info(f"🚫 [FILTRO 1H ATIVO] Compra em {symbol} descartada (Timeframe macro 1h do ativo é de QUEDA).")
@@ -615,7 +608,6 @@ class EngineExecutor:
                 logging.info(f"🚫 [FILTRO 1H ATIVO] Venda em {symbol} descartada (Timeframe macro 1h do ativo é de ALTA).")
                 continue
 
-            # FILTRO 3: VALIDAÇÃO DE LIQUIDEZ POR OPEN INTEREST
             oi_healthy = await self.check_open_interest_healthy(symbol)
             if not oi_healthy:
                 logging.info(f"🚫 [FILTRO OI] Ordem em {symbol} abortada. Sem volume de Open Interest institucional ativo.")
@@ -643,7 +635,6 @@ class EngineExecutor:
                 await self.db.add_trade(symbol, direction, current_price, sl_price, tp_price, qty, 1)
                 open_symbols.add(symbol)
 
-                # Incrementa o contador para barrar correlações no mesmo ciclo de sinais
                 if direction == 'BUY':
                     buy_positions_count += 1
                 else:
@@ -652,9 +643,9 @@ class EngineExecutor:
                 open_trades_after = await self.db.get_all_open_trades()
                 total_margin = sum((float(t[3]) * float(t[2])) / Config.ALAVANCAGEM for t in open_trades_after)
 
-                # Alinha os alvos imediatos com a correção percentual
-                alvo_atual = total_margin * f_target
-                stop_atual = total_margin * f_stop
+                # Leitura global correta sem erros de escopo (f_target)
+                alvo_atual = total_margin * self.f_target
+                stop_atual = total_margin * self.f_stop
 
                 banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
 
