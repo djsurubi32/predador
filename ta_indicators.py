@@ -21,7 +21,8 @@ def add_custom_ta(df: pd.DataFrame) -> pd.DataFrame:
     down = -1 * delta.clip(upper=0)
     ema_up = up.ewm(alpha=1/14, adjust=False).mean()
     ema_down = down.ewm(alpha=1/14, adjust=False).mean()
-    rs = ema_up / ema_down
+    # Proteção 1e-9 contra divisão por zero em momentos sem volatilidade
+    rs = ema_up / (ema_down + 1e-9)
     df['RSI_14'] = np.where(ema_down == 0, 100, 100 - (100 / (1 + rs)))
 
     # 4. ATR 14 (Average True Range)
@@ -41,10 +42,11 @@ def add_custom_ta(df: pd.DataFrame) -> pd.DataFrame:
     plus_dm_smooth = pd.Series(plus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean()
     minus_dm_smooth = pd.Series(minus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean()
 
-    plus_di = 100 * (plus_dm_smooth / tr_smooth)
-    minus_di = 100 * (minus_dm_smooth / tr_smooth)
+    # Proteção 1e-9 nos denominadores do ADX
+    plus_di = 100 * (plus_dm_smooth / (tr_smooth + 1e-9))
+    minus_di = 100 * (minus_dm_smooth / (tr_smooth + 1e-9))
 
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).abs()
+    dx = 100 * (plus_di - minus_di).abs() / ((plus_di + minus_di).abs() + 1e-9)
     df['ADX_14'] = dx.ewm(alpha=1/14, adjust=False).mean()
 
     return df

@@ -59,15 +59,15 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    MIN_SCORE_ENTRY: float = 7.5
+    MIN_SCORE_ENTRY: float = 7.0
     OPERA_CONTA_REAL: bool = False
 
     BASKET_TARGET_PCT: float = 1.00
-    BASKET_TRAILING_PULLBACK_PCT: float = 0.15
+    BASKET_TRAILING_PULLBACK_PCT: float = 0.40
     BASKET_STOP_LOSS_PCT: float = -0.75
 
     BASKET_BREAKEVEN_TRIGGER_PCT: float = 0.75
-    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.65
+    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.50
 
     MAX_PENDING_ORDER_MINUTES: int = 5
     BANCA_DEMO_INICIAL: float = 100.0
@@ -78,7 +78,7 @@ class Config:
     MAX_OPEN_TRADES: int = 5
     ALAVANCAGEM: int = 100
 
-    BARRIER_HORIZON: int = 15
+    BARRIER_HORIZON: int = 20
     BARRIER_TP_PCT: float = 1.012
     BARRIER_SL_PCT: float = 0.988
     CORRELATION_THRESHOLD: float = 0.70

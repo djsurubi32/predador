@@ -215,8 +215,14 @@ class Database:
         self.db_name = db_name
         self._create_tables()
 
+    def _get_connection(self):
+        # 🛡️ FIX COORDENAÇÃO WAL: Garante que todas as conexões SQLite ativem o WAL imediatamente ao abrir
+        conn = sqlite3.connect(self.db_name, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
     def _create_tables(self):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS trades (
                 trade_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, entry REAL,
@@ -231,7 +237,7 @@ class Database:
             conn.commit()
 
     def _get_elite_signals_sync(self):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT symbol, direction, price, prob, score, atr, sma_atr, funding, reasoning FROM elite_signals')
             rows = cursor.fetchall()
@@ -242,7 +248,7 @@ class Database:
 
     def _add_trade_sync(self, symbol, side, entry, sl, tp, qty, force):
         trade_id = hashlib.sha256(f"{symbol}{side}{time.time():.4f}".encode()).hexdigest()[:16]
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''INSERT OR REPLACE INTO trades (trade_id, symbol, side, entry, sl, tp, qty, force, open_time)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', (trade_id, symbol, side, entry, sl, tp, qty, force, time.time()))
@@ -253,7 +259,7 @@ class Database:
         return await asyncio.to_thread(self._add_trade_sync, symbol, side, entry, sl, tp, qty, force)
 
     def _get_all_open_trades_sync(self):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT symbol, side, entry, qty, open_time FROM trades')
             return cursor.fetchall()
@@ -262,7 +268,7 @@ class Database:
         return await asyncio.to_thread(self._get_all_open_trades_sync)
 
     def _remove_trade_sync(self, symbol):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM trades WHERE symbol = ?', (symbol,))
             conn.commit()
@@ -271,7 +277,7 @@ class Database:
         await asyncio.to_thread(self._remove_trade_sync, symbol)
 
     def _add_history_sync(self, symbol, side, pnl, outcome):
-        with sqlite3.connect(self.db_name, timeout=30) as conn:
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('INSERT INTO history (symbol, side, pnl, outcome) VALUES (?, ?, ?, ?)', (symbol, side, pnl, outcome))
             conn.commit()
@@ -376,6 +382,22 @@ class EngineExecutor:
             logging.error(f"Erro ao checar timeframe macro 4h para {symbol}: {e}")
             return "NEUTRAL"
 
+    # 🛡️ NOVO REQUISITO INSTITUCIONAL: Validação estrita de timeframe de 1h da moeda
+    async def check_asset_trend_1h(self, symbol: str) -> str:
+        try:
+            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '1h', limit=20)
+            if not candles or len(candles) < 20:
+                return "NEUTRAL"
+            closes = [float(c[4]) for c in candles]
+            sma = sum(closes) / len(closes)
+            current_price = closes[-1]
+            if current_price > sma: return "BULLISH"
+            elif current_price < sma: return "BEARISH"
+            return "NEUTRAL"
+        except Exception as e:
+            logging.error(f"Erro ao checar timeframe macro 1h para {symbol}: {e}")
+            return "NEUTRAL"
+
     async def check_open_interest_healthy(self, symbol: str) -> bool:
         try:
             oi_data = await asyncio.to_thread(self.public_exchange.fetch_open_interest, symbol)
@@ -444,13 +466,20 @@ class EngineExecutor:
 
         if total_margin <= 0: return
 
-        alvo_dinamico = total_margin * Config.BASKET_TARGET_PCT
-        pullback_dinamico = total_margin * Config.BASKET_TRAILING_PULLBACK_PCT
-        stop_dinamico = total_margin * Config.BASKET_STOP_LOSS_PCT
+        # 🛡️ AJUSTE MATEMÁTICO INSTITUCIONAL: Tratamento dinâmico de porcentagem (valores inteiros para decimais reais)
+        f_target = Config.BASKET_TARGET_PCT / 100.0 if Config.BASKET_TARGET_PCT >= 0.05 else Config.BASKET_TARGET_PCT
+        f_pullback = Config.BASKET_TRAILING_PULLBACK_PCT / 100.0 if Config.BASKET_TRAILING_PULLBACK_PCT >= 0.05 else Config.BASKET_TRAILING_PULLBACK_PCT
+        f_stop = Config.BASKET_STOP_LOSS_PCT / 100.0 if abs(Config.BASKET_STOP_LOSS_PCT) >= 0.05 else Config.BASKET_STOP_LOSS_PCT
+        f_breakeven_trigger = Config.BASKET_BREAKEVEN_TRIGGER_PCT / 100.0 if Config.BASKET_BREAKEVEN_TRIGGER_PCT >= 0.05 else Config.BASKET_BREAKEVEN_TRIGGER_PCT
+        f_breakeven_profit = Config.BASKET_BREAKEVEN_PROFIT_PCT / 100.0 if Config.BASKET_BREAKEVEN_PROFIT_PCT >= 0.05 else Config.BASKET_BREAKEVEN_PROFIT_PCT
 
-        gatilho_breakeven = total_margin * Config.BASKET_BREAKEVEN_TRIGGER_PCT
-        lucro_garantido_breakeven = total_margin * Config.BASKET_BREAKEVEN_PROFIT_PCT
-        passo_avanco = total_margin * 0.25
+        alvo_dinamico = total_margin * f_target
+        pullback_dinamico = total_margin * f_pullback
+        stop_dinamico = total_margin * f_stop # f_stop já traz o sinal negativo correto
+
+        gatilho_breakeven = total_margin * f_breakeven_trigger
+        lucro_garantido_breakeven = total_margin * f_breakeven_profit
+        passo_avanco = total_margin * 0.0025 # degraus elásticos de 0.25% de margem
 
         if total_net_pnl > self.max_basket_pnl:
             self.max_basket_pnl = total_net_pnl
@@ -461,7 +490,7 @@ class EngineExecutor:
         if self.max_basket_pnl >= gatilho_breakeven:
             lucro_excedente = self.max_basket_pnl - gatilho_breakeven
             degraus_avancados = math.floor(lucro_excedente / passo_avanco) if passo_avanco > 0 else 0
-            stop_dinamico = lucro_garantido_breakeven + (degraus_avancados * (total_margin * 0.125))
+            stop_dinamico = lucro_garantido_breakeven + (degraus_avancados * (total_margin * 0.00125)) # garante mais 0.125% de lucro por degrau
             breakeven_ativo = True
 
         acao = None
@@ -529,7 +558,13 @@ class EngineExecutor:
 
         if len(open_symbols) >= Config.MAX_OPEN_TRADES: return
 
+        positions = await self.execution.get_current_positions(self.db)
         now = time.time()
+
+        # 🛡️ TRAVA DE ANTI-CORRELAÇÃO DE MARGEM (ANTI-SUICÍDIO)
+        # Conta a direção das posições ativas de forma rigorosa
+        buy_positions_count = sum(1 for p in positions if p['side'] in ['LONG', 'BUY'])
+        sell_positions_count = sum(1 for p in positions if p['side'] in ['SHORT', 'SELL'])
 
         # Mapeia a direção do BTC uma única vez no ciclo para otimizar requisições
         btc_trend = await self.check_btc_trend_1h()
@@ -546,6 +581,14 @@ class EngineExecutor:
 
             direction = signal['direction']
 
+            # 🛡️ VALIDAÇÃO DA TRAVA ANTI-SUICÍDIO (MÁXIMO 3 NA MESMA DIREÇÃO NO BALDE)
+            if direction == 'BUY' and buy_positions_count >= 3:
+                logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Compra de {symbol} bloqueada. Limite direcional atingido (já existem {buy_positions_count} posições BUY no balde).")
+                continue
+            if direction == 'SELL' and sell_positions_count >= 3:
+                logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Venda de {symbol} bloqueada. Limite direcional atingido (já existem {sell_positions_count} posições SELL no balde).")
+                continue
+
             # FILTRO 1: BÚSSOLA DIRECIONAL DO BITCOIN (1h)
             if direction == 'BUY' and btc_trend == 'BEARISH':
                 logging.info(f"🚫 [FILTRO BTC] Compra em {symbol} descartada (BTC em tendência de QUEDA no 1h).")
@@ -561,6 +604,15 @@ class EngineExecutor:
                 continue
             if direction == 'SELL' and asset_trend_4h == 'BULLISH':
                 logging.info(f"🚫 [FILTRO 4H] Venda em {symbol} descartada (Timeframe macro 4h é de ALTA).")
+                continue
+
+            # 🛡️ FILTRO 2B: ALINHAMENTO DE TIMEFRAME 1H ESTRITO (DA PRÓPRIA MOEDA)
+            asset_trend_1h = await self.check_asset_trend_1h(symbol)
+            if direction == 'BUY' and asset_trend_1h == 'BEARISH':
+                logging.info(f"🚫 [FILTRO 1H ATIVO] Compra em {symbol} descartada (Timeframe macro 1h do ativo é de QUEDA).")
+                continue
+            if direction == 'SELL' and asset_trend_1h == 'BULLISH':
+                logging.info(f"🚫 [FILTRO 1H ATIVO] Venda em {symbol} descartada (Timeframe macro 1h do ativo é de ALTA).")
                 continue
 
             # FILTRO 3: VALIDAÇÃO DE LIQUIDEZ POR OPEN INTEREST
@@ -591,10 +643,18 @@ class EngineExecutor:
                 await self.db.add_trade(symbol, direction, current_price, sl_price, tp_price, qty, 1)
                 open_symbols.add(symbol)
 
+                # Incrementa o contador para barrar correlações no mesmo ciclo de sinais
+                if direction == 'BUY':
+                    buy_positions_count += 1
+                else:
+                    sell_positions_count += 1
+
                 open_trades_after = await self.db.get_all_open_trades()
                 total_margin = sum((float(t[3]) * float(t[2])) / Config.ALAVANCAGEM for t in open_trades_after)
-                alvo_atual = total_margin * Config.BASKET_TARGET_PCT
-                stop_atual = total_margin * Config.BASKET_STOP_LOSS_PCT
+
+                # Alinha os alvos imediatos com a correção percentual
+                alvo_atual = total_margin * f_target
+                stop_atual = total_margin * f_stop
 
                 banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
 
