@@ -398,7 +398,8 @@ class EngineExecutor:
 
     async def check_asset_trend_1h(self, symbol: str) -> str:
         try:
-            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, '1h', limit=20)
+            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '1h', limit=20)
+
             if not candles or len(candles) < 20:
                 return "NEUTRAL"
             closes = [float(c[4]) for c in candles]
