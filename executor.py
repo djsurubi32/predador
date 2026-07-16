@@ -216,7 +216,6 @@ class Database:
         self._create_tables()
 
     def _get_connection(self):
-        # 🛡️ FIX COORDENAÇÃO WAL: Garante que todas as conexões SQLite ativem o WAL imediatamente ao abrir
         conn = sqlite3.connect(self.db_name, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL;")
         return conn
@@ -311,12 +310,12 @@ class EngineExecutor:
         self.cooldown_memoria = {}
         self.simulated_banca = float(Config.BANCA_DEMO_INICIAL)
 
-        # 🛡️ AJUSTE MATEMÁTICO INSTITUCIONAL: Cálculo das frações transferido para o construtor (Escopo Global da Classe)
-        self.f_target = Config.BASKET_TARGET_PCT / 100.0 if Config.BASKET_TARGET_PCT >= 0.05 else Config.BASKET_TARGET_PCT
-        self.f_pullback = Config.BASKET_TRAILING_PULLBACK_PCT / 100.0 if Config.BASKET_TRAILING_PULLBACK_PCT >= 0.05 else Config.BASKET_TRAILING_PULLBACK_PCT
-        self.f_stop = Config.BASKET_STOP_LOSS_PCT / 100.0 if abs(Config.BASKET_STOP_LOSS_PCT) >= 0.05 else Config.BASKET_STOP_LOSS_PCT
-        self.f_breakeven_trigger = Config.BASKET_BREAKEVEN_TRIGGER_PCT / 100.0 if Config.BASKET_BREAKEVEN_TRIGGER_PCT >= 0.05 else Config.BASKET_BREAKEVEN_TRIGGER_PCT
-        self.f_breakeven_profit = Config.BASKET_BREAKEVEN_PROFIT_PCT / 100.0 if Config.BASKET_BREAKEVEN_PROFIT_PCT >= 0.05 else Config.BASKET_BREAKEVEN_PROFIT_PCT
+        # 🛡️ AJUSTE MATEMÁTICO CORRIGIDO: Valores lidos literalmente do config.py (1.00 = 100% da margem).
+        self.f_target = float(Config.BASKET_TARGET_PCT)
+        self.f_pullback = float(Config.BASKET_TRAILING_PULLBACK_PCT)
+        self.f_stop = float(Config.BASKET_STOP_LOSS_PCT)
+        self.f_breakeven_trigger = float(Config.BASKET_BREAKEVEN_TRIGGER_PCT)
+        self.f_breakeven_profit = float(Config.BASKET_BREAKEVEN_PROFIT_PCT)
 
     def route_and_calculate_strategy(self, opp):
         score = float(opp['score'])
@@ -472,7 +471,6 @@ class EngineExecutor:
 
         if total_margin <= 0: return
 
-        # Utilizando as variáveis de conversão instanciadas globalmente na classe
         alvo_dinamico = total_margin * self.f_target
         pullback_dinamico = total_margin * self.f_pullback
         stop_dinamico = total_margin * self.f_stop
@@ -643,7 +641,6 @@ class EngineExecutor:
                 open_trades_after = await self.db.get_all_open_trades()
                 total_margin = sum((float(t[3]) * float(t[2])) / Config.ALAVANCAGEM for t in open_trades_after)
 
-                # Leitura global correta sem erros de escopo (f_target)
                 alvo_atual = total_margin * self.f_target
                 stop_atual = total_margin * self.f_stop
 
