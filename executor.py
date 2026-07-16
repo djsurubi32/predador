@@ -197,14 +197,22 @@ class BybitExecutionEngine:
             await self.close_position_market(symbol, side, remaining_amount)
         return True
 
-    async def open_position_limit(self, symbol: str, side: str, amount: float, limit_price: float):
+    # 🛡️ RESTAURADO: Envio dos parâmetros nativos de TP e SL para a Bybit em CONTA REAL
+    async def open_position_limit(self, symbol: str, side: str, amount: float, limit_price: float, sl_price: float = None, tp_price: float = None):
         if not self.private_exchange or not self.is_real_mode: return {"status": "simulated"}
         try:
             await self.set_leverage(symbol, Config.ALAVANCAGEM)
             order_side = 'buy' if side.upper() == 'BUY' else 'sell'
             amount_str = self.private_exchange.amount_to_precision(symbol, amount)
             price_str = self.private_exchange.price_to_precision(symbol, limit_price)
-            order = await asyncio.to_thread(self.private_exchange.create_order, symbol, 'limit', order_side, float(amount_str), float(price_str))
+
+            params = {}
+            if sl_price is not None:
+                params['stopLoss'] = str(sl_price)
+            if tp_price is not None:
+                params['takeProfit'] = str(tp_price)
+
+            order = await asyncio.to_thread(self.private_exchange.create_order, symbol, 'limit', order_side, float(amount_str), float(price_str), params)
             return order
         except Exception as e:
             logging.error(f"Erro ao abrir posição Limit em {symbol}: {e}")
@@ -257,10 +265,11 @@ class Database:
     async def add_trade(self, symbol, side, entry, sl, tp, qty, force):
         return await asyncio.to_thread(self._add_trade_sync, symbol, side, entry, sl, tp, qty, force)
 
+    # 🛡️ RESTAURADO: O Select agora retorna SL (index 5) e TP (index 6) para o monitoramento individual
     def _get_all_open_trades_sync(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT symbol, side, entry, qty, open_time FROM trades')
+            cursor.execute('SELECT symbol, side, entry, qty, open_time, sl, tp FROM trades')
             return cursor.fetchall()
 
     async def get_all_open_trades(self):
@@ -310,7 +319,6 @@ class EngineExecutor:
         self.cooldown_memoria = {}
         self.simulated_banca = float(Config.BANCA_DEMO_INICIAL)
 
-        # 🛡️ AJUSTE MATEMÁTICO CORRIGIDO: Valores lidos literalmente do config.py (1.00 = 100% da margem).
         self.f_target = float(Config.BASKET_TARGET_PCT)
         self.f_pullback = float(Config.BASKET_TRAILING_PULLBACK_PCT)
         self.f_stop = float(Config.BASKET_STOP_LOSS_PCT)
@@ -453,6 +461,69 @@ class EngineExecutor:
         except Exception:
             pass
 
+    # 🛡️ RESTAURADO: O Monitoramento Individual de cada operação
+    async def monitor_individual_positions(self):
+        try:
+            positions = await self.execution.get_current_positions(self.db)
+            if not positions:
+                return
+
+            open_trades = await self.db.get_all_open_trades()
+            trade_dict = {t[0]: t for t in open_trades}
+
+            for p in positions:
+                symbol = p['symbol']
+                if symbol not in trade_dict:
+                    continue
+
+                trade = trade_dict[symbol]
+                side = trade[1].upper()
+                sl_price = float(trade[5])
+                tp_price = float(trade[6])
+
+                ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
+                current_price = float(ticker.get('last') or ticker.get('close'))
+
+                fechar = False
+                motivo = ""
+
+                # Verifica se a moeda atingiu seu limite matemático de perda ou ganho individual
+                if side in ['LONG', 'BUY']:
+                    if current_price >= tp_price:
+                        fechar = True
+                        motivo = "🎯 TAKE PROFIT INDIVIDUAL ATINGIDO"
+                    elif current_price <= sl_price:
+                        fechar = True
+                        motivo = "🛑 STOP LOSS INDIVIDUAL ATINGIDO"
+                else: # SHORT / SELL
+                    if current_price <= tp_price:
+                        fechar = True
+                        motivo = "🎯 TAKE PROFIT INDIVIDUAL ATINGIDO"
+                    elif current_price >= sl_price:
+                        fechar = True
+                        motivo = "🛑 STOP LOSS INDIVIDUAL ATINGIDO"
+
+                if fechar:
+                    amount = float(p.get('contracts', 0))
+                    if amount > 0:
+                        logging.info(f"Fechando moeda isolada {symbol} ({side}) - {motivo}")
+                        await self.execution.close_position_market(symbol, side, amount)
+
+                    pnl_realizado = float(p.get('netPnl', 0))
+                    await self.db.remove_trade(symbol)
+
+                    if not Config.OPERA_CONTA_REAL:
+                        self.simulated_banca += pnl_realizado
+
+                    await self.db.add_history(symbol, side, pnl_realizado, motivo)
+
+                    banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
+                    msg = f"{motivo} [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\nAtivo: {symbol}\nDireção: {side}\nPnL Líquido: ${pnl_realizado:.2f}\nSaldo Atual: ${banca_atual:.2f}"
+                    await TelegramLogger.send(msg)
+                    logging.info(msg.replace("\n", " - "))
+        except Exception as e:
+            logging.error(f"Erro no monitoramento individual de posições: {e}")
+
     async def manage_basket(self):
         positions = await self.execution.get_current_positions(self.db)
         now = time.time()
@@ -577,38 +648,38 @@ class EngineExecutor:
             direction = signal['direction']
 
             if direction == 'BUY' and buy_positions_count >= 3:
-                logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Compra de {symbol} bloqueada. Limite direcional atingido (já existem {buy_positions_count} posições BUY no balde).")
+                logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Compra de {symbol} bloqueada. Limite direcional atingido.")
                 continue
             if direction == 'SELL' and sell_positions_count >= 3:
-                logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Venda de {symbol} bloqueada. Limite direcional atingido (já existem {sell_positions_count} posições SELL no balde).")
+                logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Venda de {symbol} bloqueada. Limite direcional atingido.")
                 continue
 
             if direction == 'BUY' and btc_trend == 'BEARISH':
-                logging.info(f"🚫 [FILTRO BTC] Compra em {symbol} descartada (BTC em tendência de QUEDA no 1h).")
+                logging.info(f"🚫 [FILTRO BTC] Compra em {symbol} descartada (BTC em QUEDA no 1h).")
                 continue
             if direction == 'SELL' and btc_trend == 'BULLISH':
-                logging.info(f"🚫 [FILTRO BTC] Venda em {symbol} descartada (BTC em tendência de ALTA no 1h).")
+                logging.info(f"🚫 [FILTRO BTC] Venda em {symbol} descartada (BTC em ALTA no 1h).")
                 continue
 
             asset_trend_4h = await self.check_asset_trend_4h(symbol)
             if direction == 'BUY' and asset_trend_4h == 'BEARISH':
-                logging.info(f"🚫 [FILTRO 4H] Compra em {symbol} descartada (Timeframe macro 4h é de QUEDA).")
+                logging.info(f"🚫 [FILTRO 4H] Compra em {symbol} descartada (Macro 4h é de QUEDA).")
                 continue
             if direction == 'SELL' and asset_trend_4h == 'BULLISH':
-                logging.info(f"🚫 [FILTRO 4H] Venda em {symbol} descartada (Timeframe macro 4h é de ALTA).")
+                logging.info(f"🚫 [FILTRO 4H] Venda em {symbol} descartada (Macro 4h é de ALTA).")
                 continue
 
             asset_trend_1h = await self.check_asset_trend_1h(symbol)
             if direction == 'BUY' and asset_trend_1h == 'BEARISH':
-                logging.info(f"🚫 [FILTRO 1H ATIVO] Compra em {symbol} descartada (Timeframe macro 1h do ativo é de QUEDA).")
+                logging.info(f"🚫 [FILTRO 1H] Compra em {symbol} descartada (Macro 1h é de QUEDA).")
                 continue
             if direction == 'SELL' and asset_trend_1h == 'BULLISH':
-                logging.info(f"🚫 [FILTRO 1H ATIVO] Venda em {symbol} descartada (Timeframe macro 1h do ativo é de ALTA).")
+                logging.info(f"🚫 [FILTRO 1H] Venda em {symbol} descartada (Macro 1h é de ALTA).")
                 continue
 
             oi_healthy = await self.check_open_interest_healthy(symbol)
             if not oi_healthy:
-                logging.info(f"🚫 [FILTRO OI] Ordem em {symbol} abortada. Sem volume de Open Interest institucional ativo.")
+                logging.info(f"🚫 [FILTRO OI] Ordem em {symbol} abortada. Sem volume Open Interest.")
                 continue
 
             strategy = self.route_and_calculate_strategy(signal)
@@ -627,7 +698,8 @@ class EngineExecutor:
             try:
                 if Config.OPERA_CONTA_REAL:
                     limit_price = float(ticker['bid']) if direction == 'BUY' else float(ticker['ask'])
-                    order = await self.execution.open_position_limit(symbol, direction, qty, limit_price)
+                    # 🛡️ RESTAURADO: Envio dos parâmetros TP/SL diretos para a Exchange
+                    order = await self.execution.open_position_limit(symbol, direction, qty, limit_price, sl_price, tp_price)
                     if not order: continue
 
                 await self.db.add_trade(symbol, direction, current_price, sl_price, tp_price, qty, 1)
@@ -682,6 +754,8 @@ class EngineExecutor:
                 await self.reconcile_positions()
                 await self.cancel_old_pending_orders()
                 await self.execute_signals()
+                # 🛡️ RESTAURADO: Monitoramento individual rodando em paralelo ao Balde Global
+                await self.monitor_individual_positions()
                 await self.manage_basket()
             except Exception as e:
                 logging.error(f"Erro no loop principal do executor: {e}")
