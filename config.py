@@ -37,7 +37,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
                     # 2. Spread (Distância Bid/Ask) máximo de 0.05% (Evita Derrapagem / Slippage)
                     spread_pct = ((ask - bid) / bid) * 100
 
-                    # 3. Volume mínimo de 30 milhões de dólares nas últimas 24h
+                    # 3. Volume mínimo de 85 milhões de dólares nas últimas 24h
                     if spread_pct <= 0.05 and volume_24h >= 85000000:
                         moedas_validas.append((symbol, volume_24h))
 
@@ -59,15 +59,15 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    MIN_SCORE_ENTRY: float = 7.0
+    MIN_SCORE_ENTRY: float = 7.5
     OPERA_CONTA_REAL: bool = False
 
     BASKET_TARGET_PCT: float = 1.00
-    BASKET_TRAILING_PULLBACK_PCT: float = 0.40
+    BASKET_TRAILING_PULLBACK_PCT: float = 0.10
     BASKET_STOP_LOSS_PCT: float = -0.75
 
-    BASKET_BREAKEVEN_TRIGGER_PCT: float = 0.75
-    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.50
+    BASKET_BREAKEVEN_TRIGGER_PCT: float = 0.30
+    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.15
 
     MAX_PENDING_ORDER_MINUTES: int = 5
     BANCA_DEMO_INICIAL: float = 100.0
@@ -78,18 +78,18 @@ class Config:
     MAX_OPEN_TRADES: int = 5
     ALAVANCAGEM: int = 100
 
-    BARRIER_HORIZON: int = 20
+    BARRIER_HORIZON: int = 8
     BARRIER_TP_PCT: float = 1.012
     BARRIER_SL_PCT: float = 0.988
     CORRELATION_THRESHOLD: float = 0.70
     MAX_TRADE_DURATION_MINUTES: int = 240
 
-    NUM_MOEDAS_OPERACIONAIS: int = 500
+    NUM_MOEDAS_OPERACIONAIS: int = 700
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5
     TIMEFRAME: str = '15m'
-    CANDLES_TREINAMENTO_ML: int = 10000
-    HORAS_RETREINO: int = 4
+    CANDLES_TREINAMENTO_ML: int = 70000
+    HORAS_RETREINO: int = 10
     NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
     _ATIVOS: List[str] = []
