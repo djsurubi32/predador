@@ -11,6 +11,8 @@ from typing import Optional
 import requests
 from requests.adapters import HTTPAdapter
 import ccxt
+import numpy as np
+import pandas as pd
 from config import Config
 from oraculo import OraculoBinance
 
@@ -205,7 +207,7 @@ class BybitExecutionEngine:
             order_side = 'buy' if side.upper() == 'BUY' else 'sell'
             amount_str = self.private_exchange.amount_to_precision(symbol, amount)
             price_str = self.private_exchange.price_to_precision(symbol, limit_price)
-
+            
             params = {}
             if sl_price is not None:
                 params['stopLoss'] = str(sl_price)
@@ -241,7 +243,38 @@ class Database:
             cursor.execute('''CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT,
                 pnl REAL, outcome TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS cooldowns (
+                symbol TEXT PRIMARY KEY, release_time REAL)''')
             conn.commit()
+
+    def _clear_simulation_state_sync(self):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM trades')
+            cursor.execute('DELETE FROM history')
+            conn.commit()
+
+    async def clear_simulation_state(self):
+        await asyncio.to_thread(self._clear_simulation_state_sync)
+
+    def _set_cooldown_sync(self, symbol, release_time):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR REPLACE INTO cooldowns (symbol, release_time) VALUES (?, ?)', (symbol, release_time))
+            conn.commit()
+
+    async def set_cooldown(self, symbol, release_time):
+        await asyncio.to_thread(self._set_cooldown_sync, symbol, release_time)
+
+    def _get_cooldown_sync(self, symbol):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT release_time FROM cooldowns WHERE symbol = ?', (symbol,))
+            row = cursor.fetchone()
+            return row[0] if row else 0.0
+
+    async def get_cooldown(self, symbol):
+        return await asyncio.to_thread(self._get_cooldown_sync, symbol)
 
     def _get_elite_signals_sync(self):
         with self._get_connection() as conn:
@@ -309,8 +342,7 @@ class EngineExecutor:
 
         self.execution = BybitExecutionEngine(private_exchange=self.private_exchange, public_exchange=self.public_exchange, is_real_mode=Config.OPERA_CONTA_REAL)
         self.db = Database()
-
-        # 🛡️ INTEGRAÇÃO: Instanciando o Oráculo da Binance
+        
         self.oraculo = OraculoBinance()
 
         self.max_basket_pnl = 0.0
@@ -318,7 +350,6 @@ class EngineExecutor:
         self.last_global_status_time = time.time()
         self.last_empty_heartbeat = time.time()
         self.last_summary_time = time.time()
-        self.cooldown_memoria = {}
         self.simulated_banca = float(Config.BANCA_DEMO_INICIAL)
 
         self.f_target = float(Config.BASKET_TARGET_PCT)
@@ -423,6 +454,68 @@ class EngineExecutor:
         except Exception:
             return True
 
+    async def analisar_imbalance_l2_bybit(self, symbol: str) -> float:
+        try:
+            ob = await asyncio.to_thread(self.public_exchange.fetch_order_book, symbol, limit=50)
+            bids = np.array(ob['bids'])
+            asks = np.array(ob['asks'])
+
+            vol_bids = np.sum(bids[:, 0] * bids[:, 1]) if len(bids) > 0 else 0.0
+            vol_asks = np.sum(asks[:, 0] * asks[:, 1]) if len(asks) > 0 else 0.0
+
+            imbalance = (vol_bids - vol_asks) / (vol_bids + vol_asks + 1e-9)
+            return float(imbalance)
+        except Exception as e:
+            logging.error(f"Falha ao ler L2 Bybit para {symbol}: {e}")
+            return 0.0
+
+    async def analisar_delta_volume_bybit(self, symbol: str) -> float:
+        try:
+            ohlcv = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '1m', limit=15)
+            if not ohlcv or len(ohlcv) < 5:
+                return 0.0
+            
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['dir'] = np.where(df['close'] > df['open'], 1, np.where(df['close'] < df['open'], -1, 0))
+            df['vol_agressao'] = df['volume'] * df['dir']
+            
+            delta_total = df['vol_agressao'].sum()
+            volume_total = df['volume'].sum()
+
+            cvd_ratio = delta_total / (volume_total + 1e-9)
+            return float(cvd_ratio)
+        except Exception as e:
+            logging.error(f"Falha ao ler Fluxo Bybit para {symbol}: {e}")
+            return 0.0
+
+    async def validar_microestrutura_bybit(self, symbol: str, direction: str) -> tuple[bool, str]:
+        try:
+            tarefa_l2 = self.analisar_imbalance_l2_bybit(symbol)
+            tarefa_cvd = self.analisar_delta_volume_bybit(symbol)
+            
+            imbalance_l2, cvd_ratio = await asyncio.gather(tarefa_l2, tarefa_cvd)
+
+            aprovado = False
+            motivo = ""
+
+            if direction == 'BUY':
+                if imbalance_l2 >= -0.05 and cvd_ratio >= -0.05:
+                    aprovado = True
+                    motivo = f"L2: {imbalance_l2:.2f} | CVD: {cvd_ratio:.2f}"
+                else:
+                    motivo = f"Bloqueio Local (Muralha: {imbalance_l2:.2f} / Despejo: {cvd_ratio:.2f})"
+            elif direction == 'SELL':
+                if imbalance_l2 <= 0.05 and cvd_ratio <= 0.05:
+                    aprovado = True
+                    motivo = f"L2: {imbalance_l2:.2f} | CVD: {cvd_ratio:.2f}"
+                else:
+                    motivo = f"Bloqueio Local (Muralha: {imbalance_l2:.2f} / Absorção: {cvd_ratio:.2f})"
+
+            return aprovado, motivo
+        except Exception as e:
+            logging.error(f"Erro no Batedor Local Bybit para {symbol}: {e}")
+            return True, "Bybit Local Indisponível - Bypass Automático"
+
     async def reconcile_positions(self):
         if not Config.OPERA_CONTA_REAL: return
         try:
@@ -481,7 +574,7 @@ class EngineExecutor:
                 side = trade[1].upper()
                 sl_price = float(trade[5])
                 tp_price = float(trade[6])
-
+                
                 ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
                 current_price = float(ticker.get('last') or ticker.get('close'))
 
@@ -508,17 +601,23 @@ class EngineExecutor:
                     if amount > 0:
                         logging.info(f"Fechando moeda isolada {symbol} ({side}) - {motivo}")
                         await self.execution.close_position_market(symbol, side, amount)
-
+                    
                     pnl_realizado = float(p.get('netPnl', 0))
                     await self.db.remove_trade(symbol)
-
+                    
                     if not Config.OPERA_CONTA_REAL:
                         self.simulated_banca += pnl_realizado
-
+                    
                     await self.db.add_history(symbol, side, pnl_realizado, motivo)
 
                     banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
-                    msg = f"{motivo} [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\nAtivo: {symbol}\nDireção: {side}\nPnL Líquido: ${pnl_realizado:.2f}\nSaldo Atual: ${banca_atual:.2f}"
+                    msg = (
+                        f"{motivo} [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
+                        f"Ativo: {symbol}\n"
+                        f"Direção: {side}\n"
+                        f"PnL Líquido: ${pnl_realizado:.2f}\n"
+                        f"Saldo Atual: ${banca_atual:.2f}"
+                    )
                     await TelegramLogger.send(msg)
                     logging.info(msg.replace("\n", " - "))
         except Exception as e:
@@ -544,7 +643,7 @@ class EngineExecutor:
 
         alvo_dinamico = total_margin * self.f_target
         pullback_dinamico = total_margin * self.f_pullback
-        stop_dinamico = total_margin * self.f_stop
+        stop_dinamico = total_margin * self.f_stop 
 
         gatilho_breakeven = total_margin * self.f_breakeven_trigger
         lucro_garantido_breakeven = total_margin * self.f_breakeven_profit
@@ -559,7 +658,7 @@ class EngineExecutor:
         if self.max_basket_pnl >= gatilho_breakeven:
             lucro_excedente = self.max_basket_pnl - gatilho_breakeven
             degraus_avancados = math.floor(lucro_excedente / passo_avanco) if passo_avanco > 0 else 0
-            stop_dinamico = lucro_garantido_breakeven + (degraus_avancados * (total_margin * 0.00125))
+            stop_dinamico = lucro_garantido_breakeven + (degraus_avancados * (total_margin * 0.00125)) 
             breakeven_ativo = True
 
         acao = None
@@ -569,13 +668,24 @@ class EngineExecutor:
         if total_net_pnl <= stop_dinamico:
             acao = "FECHAR_TUDO"
             if breakeven_ativo:
-                motivo = f"🔵 CATRACA MÓVEL ACIONADA [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\nProteção elástica executada.\nResultado líquido: ${lucro_final:.2f}"
+                motivo = (
+                    f"🔵 CATRACA MÓVEL ACIONADA [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
+                    f"Proteção elástica executada.\n"
+                    f"Resultado líquido: ${lucro_final:.2f}"
+                )
             else:
-                motivo = f"🛑 STOP LOSS DO BALDE ACIONADO [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\nCortando perdas líquidas agregadas em: ${lucro_final:.2f}"
+                motivo = (
+                    f"🛑 STOP LOSS DO BALDE ACIONADO [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
+                    f"Cortando perdas líquidas agregadas em: ${lucro_final:.2f}"
+                )
 
         elif self.max_basket_pnl >= alvo_dinamico and (self.max_basket_pnl - total_net_pnl) >= pullback_dinamico:
             acao = "FECHAR_TUDO"
-            motivo = f"🎯 TRAILING GLOBAL ATIVADO [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\nEsvaziando balde adaptativo.\nResultado LÍQUIDO líquido: ${lucro_final:.2f}"
+            motivo = (
+                f"🎯 TRAILING GLOBAL ATIVADO [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
+                f"Esvaziando balde adaptativo.\n"
+                f"Resultado LÍQUIDO líquido: ${lucro_final:.2f}"
+            )
 
         if acao == "FECHAR_TUDO":
             if not Config.OPERA_CONTA_REAL:
@@ -640,7 +750,7 @@ class EngineExecutor:
 
             if symbol in open_symbols: continue
 
-            tempo_liberacao = self.cooldown_memoria.get(symbol, 0)
+            tempo_liberacao = await self.db.get_cooldown(symbol)
             if now < tempo_liberacao: continue
 
             if len(open_symbols) >= Config.MAX_OPEN_TRADES: break
@@ -682,10 +792,14 @@ class EngineExecutor:
                 logging.info(f"🚫 [FILTRO OI] Ordem em {symbol} abortada. Sem volume Open Interest.")
                 continue
 
-            # 🛡️ INTEGRAÇÃO: O Juízo Final do Oráculo da Binance
             oraculo_aprovado, oraculo_motivo = await self.oraculo.validar_sinal_institucional(symbol, direction)
             if not oraculo_aprovado:
                 logging.info(f"🚫 [ORÁCULO BINANCE] Ordem em {symbol} ({direction}) bloqueada pela Binance. Motivo: {oraculo_motivo}")
+                continue
+
+            bybit_aprovado, bybit_motivo = await self.validar_microestrutura_bybit(symbol, direction)
+            if not bybit_aprovado:
+                logging.info(f"🚫 [BATEDOR BYBIT] Ordem em {symbol} ({direction}) bloqueada localmente. Motivo: {bybit_motivo}")
                 continue
 
             strategy = self.route_and_calculate_strategy(signal)
@@ -709,7 +823,7 @@ class EngineExecutor:
 
                 await self.db.add_trade(symbol, direction, current_price, sl_price, tp_price, qty, 1)
                 open_symbols.add(symbol)
-
+                
                 if direction == 'BUY':
                     buy_positions_count += 1
                 else:
@@ -717,7 +831,7 @@ class EngineExecutor:
 
                 open_trades_after = await self.db.get_all_open_trades()
                 total_margin = sum((float(t[3]) * float(t[2])) / Config.ALAVANCAGEM for t in open_trades_after)
-
+                
                 alvo_atual = total_margin * self.f_target
                 stop_atual = total_margin * self.f_stop
 
@@ -730,7 +844,8 @@ class EngineExecutor:
                     f"Valor alocado: ${amount_to_invest:.2f} ({strategy['lote_tipo']})\n"
                     f"Score: {signal['score']:.1f}/10.0 | probabilidade: {signal['prob']:.1f}%\n"
                     f"Ml: {signal['reasoning']}\n"
-                    f"Oráculo: {oraculo_motivo}\n"
+                    f"Oráculo Binance: {oraculo_motivo}\n"
+                    f"Batedor Bybit: Validado Local ({bybit_motivo})\n"
                     f"Saldo da banca: ${banca_atual:.2f}\n\n"
                     f"📊 <b>STATUS DO BALDE:</b>\n"
                     f"Margem Total: ${total_margin:.2f}\n"
@@ -741,7 +856,7 @@ class EngineExecutor:
                 await TelegramLogger.send(msg)
                 logging.info(f"Ordem aberta ({modo_texto}): {symbol} {direction} - Tipo: {strategy['lote_tipo']} - Preço: {current_price}")
 
-                self.cooldown_memoria[symbol] = now + (60 * 60)
+                await self.db.set_cooldown(symbol, now + (60 * 60))
 
             except Exception as e:
                 logging.error(f"Erro ao executar sinal {symbol}: {e}")
@@ -749,10 +864,21 @@ class EngineExecutor:
     async def start_execution_loop(self):
         logging.info("🚀 PREDADOR QUANTITATIVO ONLINE")
 
+        if not Config.OPERA_CONTA_REAL:
+            logging.info("🧹 Modo SIMULAÇÃO detectado. Executando limpeza de operações fantasmas e histórico do banco de dados...")
+            await self.db.clear_simulation_state()
+
         await asyncio.to_thread(self.execution.init_markets_sync)
 
         modo = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO/DEMO 🔬"
-        msg_inicio = f"🚀 PREDADOR QUANTITATIVO ONLINE\nO motor executor foi iniciado com sucesso!\nModo Operacional: {modo}\nAlavancagem Fixa: {Config.ALAVANCAGEM}x\nLimite do Balde: {Config.MAX_OPEN_TRADES} trades simultâneos.\nSaldo Inicial: ${Config.BANCA_DEMO_INICIAL:.2f}"
+        msg_inicio = (
+            f"🚀 PREDADOR QUANTITATIVO ONLINE\n"
+            f"O motor executor foi iniciado com sucesso!\n"
+            f"Modo Operacional: {modo}\n"
+            f"Alavancagem Fixa: {Config.ALAVANCAGEM}x\n"
+            f"Limite do Balde: {Config.MAX_OPEN_TRADES} trades simultâneos.\n"
+            f"Saldo Inicial: ${Config.BANCA_DEMO_INICIAL:.2f}"
+        )
         await TelegramLogger.send(msg_inicio)
 
         while True:
