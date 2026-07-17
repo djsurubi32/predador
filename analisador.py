@@ -20,7 +20,7 @@ class AnalisadorRadar:
     def __init__(self, public_exchange: ccxt.bybit, db_name: str = "predador_v31.db"):
         self.exchange = public_exchange
         self.db_name = db_name
-        # Instanciamos o motor de treinamento APENAS para herdar a preparação exata de features (19 colunas)
+        # Instanciamos o motor de treinamento APENAS para herdar a preparação exata de features
         # garantindo 100% de paridade matemática entre o backtest e o mercado ao vivo.
         self.motor_base = MotorTreinamento()
 
@@ -35,16 +35,28 @@ class AnalisadorRadar:
             except Exception:
                 oi_map = {}
 
+            # NOVA BUSCA: Funding Rate assíncrono para a IA ler a Caça à Liquidez
+            try:
+                fr_data = await asyncio.to_thread(self.exchange.fetch_funding_rate_history, symbol, limit=limit)
+                fr_map = {int(item.get('timestamp', 0)): float(item.get('fundingRate', 0)) for item in fr_data}
+            except Exception:
+                fr_map = {}
+
             merged = []
             last_oi = 0.0
+            last_fr = 0.0
             for bar in ohlcv:
                 ts = int(bar[0])
                 if oi_map.get(ts, 0.0) != 0.0:
                     last_oi = oi_map.get(ts, 0.0)
-                merged.append([bar[0], bar[1], bar[2], bar[3], bar[4], bar[5], last_oi])
+                if fr_map.get(ts) is not None:
+                    last_fr = fr_map.get(ts)
+                
+                merged.append([bar[0], bar[1], bar[2], bar[3], bar[4], bar[5], last_oi, last_fr])
 
-            df = pd.DataFrame(merged, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest'])
-            for col in ['open', 'high', 'low', 'close', 'volume', 'open_interest']:
+            # DataFrame atualizado com a coluna funding_rate
+            df = pd.DataFrame(merged, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate'])
+            for col in ['open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             df.ffill(inplace=True)
             return df
@@ -63,7 +75,7 @@ class AnalisadorRadar:
         if df.empty or len(df) < 50:
             return
 
-        # 🧠 HERANÇA INSTITUCIONAL: Aplica as 19 features exatas do Treinador com Multi-Timeframe (1h/4h)
+        # 🧠 HERANÇA INSTITUCIONAL: Aplica as 34 features (originais + 15 sensores) exatas do Treinador com Multi-Timeframe (1h/4h)
         df = self.motor_base.prepare_features(df, btc_df)
 
         try:
@@ -83,11 +95,15 @@ class AnalisadorRadar:
         except Exception:
             df['hmm_regime'] = 0
 
+        # ARRAY ATUALIZADO: 34 Features exatas exigidas pelos modelos retreinados
         features = [
-            'RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos',
-            'ADX_14', 'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence',
-            'cvd_trend', 'oi_change', 'oi_trend', 'oi_price_divergence',
-            'mtf_dist_1h', 'mtf_dist_4h', 'btc_log_return', 'btc_correlation', 'noise_index'
+            'RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos', 'ADX_14', 
+            'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence', 'cvd_trend', 'oi_change', 
+            'oi_trend', 'oi_price_divergence', 'mtf_dist_1h', 'mtf_dist_4h', 'btc_log_return', 
+            'btc_correlation', 'noise_index',
+            'obv_rsi_div', 'cvd_accel', 'vwap_dist', 'liq_vacuum', 'funding_rate_delta', 
+            'oi_momentum', 'nvi', 'hurst_proxy', 'z_score_50', 'autocorr_3', 
+            'fractal_dim', 'squeeze_ratio', 'natr', 'skewness_20', 'macd_hist_vel'
         ]
 
         latest_row = df.iloc[-1]
@@ -128,6 +144,7 @@ class AnalisadorRadar:
 
                     atr_atual = float(latest_row.get('ATRr_14', 0.0))
                     sma_atr = float(latest_row.get('SMA_ATR_100', 0.0))
+                    funding_atual = float(latest_row.get('funding_rate', 0.0))
 
                     rsi_atual = latest_row['RSI_14']
                     fluxo_score = 3.0 if (rsi_atual > 65 or rsi_atual < 35) else 2.0 if (rsi_atual > 55 or rsi_atual < 45) else 1.0
@@ -150,18 +167,19 @@ class AnalisadorRadar:
                         score=score,
                         atr=atr_atual,
                         sma_atr=sma_atr,
+                        funding=funding_atual,
                         reasoning=reasoning
                     )
         except Exception as e:
             logging.error(f"Erro na matriz de predição de {symbol}: {e}")
 
-    def salvar_sinal_db(self, symbol: str, direction: str, price: float, prob: float, score: float, atr: float, sma_atr: float, reasoning: str):
+    def salvar_sinal_db(self, symbol: str, direction: str, price: float, prob: float, score: float, atr: float, sma_atr: float, funding: float, reasoning: str):
         with sqlite3.connect(self.db_name, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute('''INSERT OR REPLACE INTO elite_signals
                 (symbol, direction, price, prob, score, atr, sma_atr, funding, reasoning, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (symbol, direction, price, prob, score, atr, sma_atr, 0.0, reasoning, time.time()))
+                (symbol, direction, price, prob, score, atr, sma_atr, funding, reasoning, time.time()))
             conn.commit()
 
     async def limpar_sinais_db(self):
@@ -201,3 +219,4 @@ class AnalisadorRadar:
             await self.analisar_ativo(symbol, btc_df)
         except Exception as e:
             logging.error(f"Falha segura ao processar {symbol} no radar: {e}")
+            
