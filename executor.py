@@ -366,37 +366,38 @@ class EngineExecutor:
         is_fluxo_maximo = "Fluxo:3.0" in reasoning_clean
         is_espaco_expandido = "ML_Espaço:3.0" in reasoning_clean
 
+        # 🛡️ AJUSTE ESTRUTURAL (Alavancagem 20x): Maior fôlego de SL para buscar alvos exponenciais
         if score >= 9.0 and prob >= 75.0:
             return {
                 "vertente": "QUALIDADE EXTREMA (SNIPER)",
                 "lote_tipo": "Lote Sniper",
                 "invest_amount": 6.0,
-                "tp_factor": 1.020,
-                "sl_factor": 0.990
+                "tp_factor": 1.050,  # Busca 5% de movimento na moeda (100% de lucro sobre a margem a 20x)
+                "sl_factor": 0.970   # Tolera 3% de oscilação contra (perda de 60% da margem alocada)
             }
         elif is_fluxo_maximo:
             return {
                 "vertente": "SCALPING DE MOMENTUM",
                 "lote_tipo": "Lote Padrão",
                 "invest_amount": 4.0,
-                "tp_factor": 1.008,
-                "sl_factor": 0.995
+                "tp_factor": 1.020,  # Busca 2% de movimento (40% de lucro a 20x)
+                "sl_factor": 0.985   # Tolera 1.5% de oscilação contra
             }
         elif is_espaco_expandido:
             return {
                 "vertente": "DAY TRADE DE EXPANSÃO",
                 "lote_tipo": "Lote Leve",
                 "invest_amount": 3.0,
-                "tp_factor": 1.040,
-                "sl_factor": 0.980
+                "tp_factor": 1.060,  # Busca 6% de movimento (120% de lucro a 20x)
+                "sl_factor": 0.960   # Tolera 4% de oscilação contra
             }
 
         return {
             "vertente": "PADRÃO ADAPTATIVO",
             "lote_tipo": "Lote de Teste",
             "invest_amount": 2.0,
-            "tp_factor": 1.012,
-            "sl_factor": 0.988
+            "tp_factor": 1.030,  # Busca 3% de movimento (60% de lucro a 20x)
+            "sl_factor": 0.975   # Tolera 2.5% de oscilação contra
         }
 
     async def check_btc_trend_1h(self) -> str:
