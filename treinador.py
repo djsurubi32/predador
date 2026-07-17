@@ -62,20 +62,34 @@ class MotorTreinamento:
             time.sleep(1.5) 
             
             ohlcv = self.exchange.fetch_ohlcv(symbol, Config.TIMEFRAME, limit=limit)
+            
+            # Extração de Open Interest (Contratos Abertos)
             try:
-                time.sleep(0.5) # Pausa extra para os dados de Open Interest
+                time.sleep(0.5) 
                 oi_data = self.exchange.fetch_open_interest_history(symbol, Config.TIMEFRAME, limit=limit)
                 oi_map = {int(item.get('timestamp', 0)): float(item.get('openInterestValue') or item.get('info', {}).get('openInterest', 0)) for item in oi_data}
             except Exception:
                 oi_map = {}
 
+            # Extração de Funding Rate (Taxa de Financiamento - Caça à Liquidez)
+            try:
+                time.sleep(0.5)
+                fr_data = self.exchange.fetch_funding_rate_history(symbol, limit=limit)
+                fr_map = {int(item.get('timestamp', 0)): float(item.get('fundingRate', 0)) for item in fr_data}
+            except Exception:
+                fr_map = {}
+
             merged = []
             last_oi = 0.0
+            last_fr = 0.0
             for bar in ohlcv:
                 ts = int(bar[0])
                 if oi_map.get(ts, 0.0) != 0.0:
                     last_oi = oi_map.get(ts, 0.0)
-                merged.append([bar[0], bar[1], bar[2], bar[3], bar[4], bar[5], last_oi])
+                if fr_map.get(ts) is not None:
+                    last_fr = fr_map.get(ts)
+                
+                merged.append([bar[0], bar[1], bar[2], bar[3], bar[4], bar[5], last_oi, last_fr])
             return merged
         except Exception as e:
             logging.error(f"Erro de I/O ao extrair histórico de {symbol}: {e}")
@@ -107,6 +121,10 @@ class MotorTreinamento:
 
         vol_mean, vol_std = df['volume'].rolling(20).mean(), df['volume'].rolling(20).std()
         df['vol_zscore'] = (df['volume'] - vol_mean) / (vol_std + 1e-9)
+        
+        # Criação segura do EMA_20, caso falte da biblioteca customizada
+        if 'EMA_20' not in df.columns:
+            df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
         df['price_vs_ema'] = df['close'] - df['EMA_20']
         
         bbl = df.get('BBL_20_2.0', df['close'])
@@ -134,7 +152,94 @@ class MotorTreinamento:
         else:
             df['oi_change'] = 0.0; df['oi_trend'] = 0.0; df['oi_price_divergence'] = 0.0
 
+        # ====================================================================================
+        # 🚀 INÍCIO DOS 15 SENSORES QUANTITATIVOS INSTITUCIONAIS
+        # ====================================================================================
+
+        # 1. Divergência OBV vs. RSI (Volume vs Força Relativa)
+        df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
+        df['obv_slope'] = df['obv'].diff(3).fillna(0.0)
+        df['obv_rsi_div'] = np.where((df['obv_slope'] > 0) & (df['rsi_slope'] < 0), 1.0,
+                            np.where((df['obv_slope'] < 0) & (df['rsi_slope'] > 0), -1.0, 0.0))
+
+        # 2. Aceleração do CVD (Segunda Derivada do Delta de Volume)
+        df['cvd_accel'] = df['cvd'].diff(3).diff(3).fillna(0.0)
+
+        # 3. Distância da VWAP Ancorada (Preço Justo Diário)
         df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+        df['vol_price'] = df['volume'] * df['typical_price']
+        df['date_only'] = df['datetime'].dt.date
+        df['cum_vol_price'] = df.groupby('date_only')['vol_price'].cumsum()
+        df['cum_vol'] = df.groupby('date_only')['volume'].cumsum()
+        df['vwap'] = df['cum_vol_price'] / (df['cum_vol'] + 1e-9)
+        df['vwap_dist'] = ((df['close'] - df['vwap']) / (df['vwap'] + 1e-9)).fillna(0.0)
+
+        # 4. Vácuo de Liquidez (Dinâmica do Spread Proxy)
+        df['liq_vacuum'] = ((df['high'] - df['low']) / (df['volume'] + 1e-9)).rolling(10).mean().fillna(0.0)
+
+        # 5. Variação do Funding Rate (Ataque ao Varejo)
+        if 'funding_rate' in df.columns:
+            df['funding_rate'] = df['funding_rate'].replace(0, np.nan).ffill().fillna(0.0)
+            df['funding_rate_delta'] = df['funding_rate'].diff(3).fillna(0.0)
+        else:
+            df['funding_rate_delta'] = 0.0
+
+        # 6. Momentum de Open Interest (Velocidade de Contratos)
+        if 'open_interest' in df.columns:
+            df['oi_momentum'] = (df['open_interest'].diff(5) / (df['open_interest'].rolling(20).mean() + 1e-9)).fillna(0.0)
+        else:
+            df['oi_momentum'] = 0.0
+
+        # 7. Smart Money Proxy (Negative Volume Index - NVI)
+        vol_drop = df['volume'] < df['volume'].shift(1)
+        roc = df['close'].pct_change().fillna(0.0)
+        df['nvi'] = (vol_drop * roc).cumsum().fillna(0.0)
+
+        # 8. Expoente de Hurst (Mapeamento de Regimes: Tendência vs Lateral)
+        lag1_var = df['log_return'].rolling(20).var().fillna(0.0)
+        lag5_var = df['close'].pct_change(5).rolling(20).var().fillna(0.0)
+        df['hurst_proxy'] = (np.log(lag5_var + 1e-9) / np.log(lag1_var + 1e-9)).fillna(0.0)
+
+        # 9. Z-Score (Extremos Matemáticos do Preço)
+        df['z_score_50'] = ((df['close'] - df['close'].rolling(50).mean()) / (df['close'].rolling(50).std() + 1e-9)).fillna(0.0)
+
+        # 10. Autocorrelação de Retornos (Memória do Mercado)
+        df['autocorr_3'] = df['log_return'].rolling(20).apply(lambda x: x.autocorr(lag=3) if len(x.dropna()) > 3 else 0, raw=False).fillna(0.0)
+
+        # 11. Dimensão Fractal (Caos vs Estrutura)
+        n_period = 20
+        high_max = df['high'].rolling(n_period).max()
+        low_min = df['low'].rolling(n_period).min()
+        path_length = np.abs(df['close'].diff()).rolling(n_period).sum()
+        df['fractal_dim'] = (np.log(path_length + 1e-9) / np.log((high_max - low_min) + 1e-9)).fillna(0.0)
+
+        # 12. Squeeze Keltner/Bollinger (O Efeito Mola)
+        atr_14 = df.get('ATRr_14', df['close'].rolling(14).std())
+        df['kc_upper'] = df['EMA_20'] + (1.5 * atr_14)
+        df['kc_lower'] = df['EMA_20'] - (1.5 * atr_14)
+        bb_width = bbu - bbl
+        kc_width = df['kc_upper'] - df['kc_lower']
+        df['squeeze_ratio'] = (bb_width / (kc_width + 1e-9)).fillna(1.0)
+
+        # 13. ATR Normalizado (Combustível Absoluto)
+        df['natr'] = ((atr_14 / df['close']) * 100).fillna(0.0)
+
+        # 14. Skewness de Retornos (Assimetria do Medo/Ganância)
+        df['skewness_20'] = df['log_return'].rolling(20).skew().fillna(0.0)
+
+        # 15. Velocidade do Histograma MACD
+        ema9_macd = df['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['MACD_12_26_9'] - ema9_macd
+        df['macd_hist_vel'] = df['macd_hist'].diff(2).fillna(0.0)
+
+        # Limpeza rápida das colunas extras geradas
+        df.drop(columns=['typical_price', 'vol_price', 'date_only', 'cum_vol_price', 'cum_vol', 'vwap', 'obv', 'obv_slope', 'kc_upper', 'kc_lower', 'macd_hist'], inplace=True, errors='ignore')
+
+        # ====================================================================================
+        # FIM DA INJEÇÃO DOS 15 SENSORES QUANTITATIVOS
+        # ====================================================================================
+
         df_indexed = df.set_index('datetime')
 
         df_1h = df_indexed['close'].resample('1h').last().to_frame(name='close_1h')
@@ -198,8 +303,8 @@ class MotorTreinamento:
         if len(bars) < 100:
             return f"⚠️ Dados insuficientes para {symbol}."
 
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest'])
-        for col in ['open', 'high', 'low', 'close', 'volume', 'open_interest']:
+        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate'])
+        for col in ['open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df.ffill(inplace=True)
@@ -235,7 +340,17 @@ class MotorTreinamento:
             hmm_model = DummyHMM() 
             df['hmm_regime'] = 0
 
-        features = ['RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos', 'ADX_14', 'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence', 'cvd_trend', 'oi_change', 'oi_trend', 'oi_price_divergence', 'mtf_dist_1h', 'mtf_dist_4h', 'btc_log_return', 'btc_correlation', 'noise_index']
+        # INJEÇÃO DAS NOVAS COLUNAS NA MATRIZ DE APRENDIZADO
+        features = [
+            'RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos', 'ADX_14', 
+            'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence', 'cvd_trend', 'oi_change', 
+            'oi_trend', 'oi_price_divergence', 'mtf_dist_1h', 'mtf_dist_4h', 'btc_log_return', 
+            'btc_correlation', 'noise_index',
+            # --- Novos 15 Sensores ---
+            'obv_rsi_div', 'cvd_accel', 'vwap_dist', 'liq_vacuum', 'funding_rate_delta', 
+            'oi_momentum', 'nvi', 'hurst_proxy', 'z_score_50', 'autocorr_3', 
+            'fractal_dim', 'squeeze_ratio', 'natr', 'skewness_20', 'macd_hist_vel'
+        ]
         X, y = df[features], df['target'].astype(int)
 
         lgbm = lgb.LGBMClassifier(n_estimators=120, learning_rate=0.05, max_depth=6, num_leaves=31, random_state=42, verbose=-1, n_jobs=-1)
@@ -271,7 +386,7 @@ class MotorTreinamento:
         logging.info(f"🚀 Iniciando Treinador Quantitativo 10/10 (Lote de {len(ativos)} moedas)...")
         
         btc_data_raw = self.get_btc_data_sync()
-        btc_train_df = pd.DataFrame(btc_data_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest']) if btc_data_raw else None
+        btc_train_df = pd.DataFrame(btc_data_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate']) if btc_data_raw else None
 
         # 🛡️ FIX INSTITUCIONAL: Limita a 2 processos simultâneos para evitar banimento da Bybit
         max_threads = 2 
@@ -307,3 +422,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         logging.info("🛑 Treinador encerrado pelo usuário.")
+            
