@@ -76,7 +76,7 @@ class Config:
     MAX_POSITION_RISK: float = 0.045
 
     MAX_OPEN_TRADES: int = 5
-    ALAVANCAGEM: int = 100
+    ALAVANCAGEM: int = 20
 
     BARRIER_HORIZON: int = 8
     BARRIER_TP_PCT: float = 1.012
