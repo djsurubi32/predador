@@ -70,11 +70,11 @@ class OraculoBinance:
                 return 0.0
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
+            
             # Cálculo de agressão vetorial
             df['dir'] = np.where(df['close'] > df['open'], 1, np.where(df['close'] < df['open'], -1, 0))
             df['vol_agressao'] = df['volume'] * df['dir']
-
+            
             delta_total = df['vol_agressao'].sum()
             volume_total = df['volume'].sum()
 
@@ -96,25 +96,24 @@ class OraculoBinance:
             # Executa a varredura L2 e CVD em paralelo para máxima velocidade
             tarefa_l2 = self.analisar_imbalance_l2(symbol_binance)
             tarefa_cvd = self.analisar_delta_volume(symbol_binance)
-
+            
             imbalance_l2, cvd_ratio = await asyncio.gather(tarefa_l2, tarefa_cvd)
 
             aprovado = False
             motivo = ""
 
-            # Nível de Exigência do Oráculo:
-            # Rejeita entradas onde o livro da Binance tem mais de 25% de força oposta (Imbalance extremo)
-            # Rejeita entradas onde a agressão de mercado atual (CVD) seja maior que 20% contra o sinal
-
+            # 🛡️ AJUSTE INSTITUCIONAL: Travas ultra-rígidas contra Squeeze Direcional
             if direcao_bybit == 'BUY':
-                if imbalance_l2 >= -0.25 and cvd_ratio >= -0.20:
+                # Exige que não haja muralhas de venda fortes nem fluxo vendedor engolindo a compra (-0.05)
+                if imbalance_l2 >= -0.05 and cvd_ratio >= -0.05:
                     aprovado = True
                     motivo = f"Validado Binance (L2 Imbalance: {imbalance_l2:.2f} | CVD 1m: {cvd_ratio:.2f})"
                 else:
                     motivo = f"Bloqueado Binance (Muralha Vendedora {imbalance_l2:.2f} ou Despejo no Volume {cvd_ratio:.2f})"
-
+            
             elif direcao_bybit == 'SELL':
-                if imbalance_l2 <= 0.25 and cvd_ratio <= 0.20:
+                # Exige que não haja muralhas de compra fortes nem fluxo comprador forte engolindo a venda (0.05)
+                if imbalance_l2 <= 0.05 and cvd_ratio <= 0.05:
                     aprovado = True
                     motivo = f"Validado Binance (L2 Imbalance: {imbalance_l2:.2f} | CVD 1m: {cvd_ratio:.2f})"
                 else:
@@ -127,16 +126,14 @@ class OraculoBinance:
             # Em caso de falha de API do Oráculo, liberamos a trade para não paralisar o Predador primário
             return True, "Oráculo Indisponível - Bypass Automático"
 
-# --- BLOCO DE TESTE INDEPENDENTE (Se quiser testar só este arquivo rodando "python oraculo.py") ---
+# --- BLOCO DE TESTE INDEPENDENTE ---
 if __name__ == "__main__":
     async def teste_oraculo():
         oraculo = OraculoBinance()
-
-        # Simulando que o Predador mandou COMPRAR Bitcoin na Bybit
+        
         aprovado, razao = await oraculo.validar_sinal_institucional('BTC/USDT:USDT', 'BUY')
         print(f"Teste BUY BTC: Aprovado={aprovado} | Razão: {razao}")
-
-        # Simulando que o Predador mandou VENDER Ethereum na Bybit
+        
         aprovado, razao = await oraculo.validar_sinal_institucional('ETH/USDT:USDT', 'SELL')
         print(f"Teste SELL ETH: Aprovado={aprovado} | Razão: {razao}")
 
