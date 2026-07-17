@@ -12,6 +12,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import ccxt
 from config import Config
+from oraculo import OraculoBinance
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -197,7 +198,6 @@ class BybitExecutionEngine:
             await self.close_position_market(symbol, side, remaining_amount)
         return True
 
-    # 🛡️ RESTAURADO: Envio dos parâmetros nativos de TP e SL para a Bybit em CONTA REAL
     async def open_position_limit(self, symbol: str, side: str, amount: float, limit_price: float, sl_price: float = None, tp_price: float = None):
         if not self.private_exchange or not self.is_real_mode: return {"status": "simulated"}
         try:
@@ -265,7 +265,6 @@ class Database:
     async def add_trade(self, symbol, side, entry, sl, tp, qty, force):
         return await asyncio.to_thread(self._add_trade_sync, symbol, side, entry, sl, tp, qty, force)
 
-    # 🛡️ RESTAURADO: O Select agora retorna SL (index 5) e TP (index 6) para o monitoramento individual
     def _get_all_open_trades_sync(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -310,6 +309,9 @@ class EngineExecutor:
 
         self.execution = BybitExecutionEngine(private_exchange=self.private_exchange, public_exchange=self.public_exchange, is_real_mode=Config.OPERA_CONTA_REAL)
         self.db = Database()
+
+        # 🛡️ INTEGRAÇÃO: Instanciando o Oráculo da Binance
+        self.oraculo = OraculoBinance()
 
         self.max_basket_pnl = 0.0
         self.min_basket_pnl = 0.0
@@ -399,7 +401,6 @@ class EngineExecutor:
     async def check_asset_trend_1h(self, symbol: str) -> str:
         try:
             candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '1h', limit=20)
-
             if not candles or len(candles) < 20:
                 return "NEUTRAL"
             closes = [float(c[4]) for c in candles]
@@ -462,7 +463,6 @@ class EngineExecutor:
         except Exception:
             pass
 
-    # 🛡️ RESTAURADO: O Monitoramento Individual de cada operação
     async def monitor_individual_positions(self):
         try:
             positions = await self.execution.get_current_positions(self.db)
@@ -488,7 +488,6 @@ class EngineExecutor:
                 fechar = False
                 motivo = ""
 
-                # Verifica se a moeda atingiu seu limite matemático de perda ou ganho individual
                 if side in ['LONG', 'BUY']:
                     if current_price >= tp_price:
                         fechar = True
@@ -496,7 +495,7 @@ class EngineExecutor:
                     elif current_price <= sl_price:
                         fechar = True
                         motivo = "🛑 STOP LOSS INDIVIDUAL ATINGIDO"
-                else: # SHORT / SELL
+                else:
                     if current_price <= tp_price:
                         fechar = True
                         motivo = "🎯 TAKE PROFIT INDIVIDUAL ATINGIDO"
@@ -683,6 +682,12 @@ class EngineExecutor:
                 logging.info(f"🚫 [FILTRO OI] Ordem em {symbol} abortada. Sem volume Open Interest.")
                 continue
 
+            # 🛡️ INTEGRAÇÃO: O Juízo Final do Oráculo da Binance
+            oraculo_aprovado, oraculo_motivo = await self.oraculo.validar_sinal_institucional(symbol, direction)
+            if not oraculo_aprovado:
+                logging.info(f"🚫 [ORÁCULO BINANCE] Ordem em {symbol} ({direction}) bloqueada pela Binance. Motivo: {oraculo_motivo}")
+                continue
+
             strategy = self.route_and_calculate_strategy(signal)
             amount_to_invest = strategy["invest_amount"]
 
@@ -699,7 +704,6 @@ class EngineExecutor:
             try:
                 if Config.OPERA_CONTA_REAL:
                     limit_price = float(ticker['bid']) if direction == 'BUY' else float(ticker['ask'])
-                    # 🛡️ RESTAURADO: Envio dos parâmetros TP/SL diretos para a Exchange
                     order = await self.execution.open_position_limit(symbol, direction, qty, limit_price, sl_price, tp_price)
                     if not order: continue
 
@@ -726,6 +730,7 @@ class EngineExecutor:
                     f"Valor alocado: ${amount_to_invest:.2f} ({strategy['lote_tipo']})\n"
                     f"Score: {signal['score']:.1f}/10.0 | probabilidade: {signal['prob']:.1f}%\n"
                     f"Ml: {signal['reasoning']}\n"
+                    f"Oráculo: {oraculo_motivo}\n"
                     f"Saldo da banca: ${banca_atual:.2f}\n\n"
                     f"📊 <b>STATUS DO BALDE:</b>\n"
                     f"Margem Total: ${total_margin:.2f}\n"
@@ -755,7 +760,6 @@ class EngineExecutor:
                 await self.reconcile_positions()
                 await self.cancel_old_pending_orders()
                 await self.execute_signals()
-                # 🛡️ RESTAURADO: Monitoramento individual rodando em paralelo ao Balde Global
                 await self.monitor_individual_positions()
                 await self.manage_basket()
             except Exception as e:
