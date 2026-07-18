@@ -38,7 +38,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
                     spread_pct = ((ask - bid) / bid) * 100
 
                     # 3. Volume mínimo de 85 milhões de dólares nas últimas 24h
-                    if spread_pct <= 0.05 and volume_24h >= 100000000:
+                    if spread_pct <= 0.05 and volume_24h >= 30000000:
                         moedas_validas.append((symbol, volume_24h))
 
         moedas_validas.sort(key=lambda x: x[1], reverse=True)
@@ -59,27 +59,27 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    MIN_SCORE_ENTRY: float = 7.0
+    MIN_SCORE_ENTRY: float = 8.5
     OPERA_CONTA_REAL: bool = False
 
     # ---------------------------------------------------------
     # GESTÃO GLOBAL DO BALDE (AJUSTADO PARA 20X)
     # ---------------------------------------------------------
-    BASKET_TARGET_PCT: float = 1.00             # Alvo Global: 100% de lucro sobre a margem total alocada
+    BASKET_TARGET_PCT: float = 3.00             # Alvo Global: 100% de lucro sobre a margem total alocada
     BASKET_TRAILING_PULLBACK_PCT: float = 0.15  # Trailing: Recuo de 15% após atingir o alvo
     BASKET_STOP_LOSS_PCT: float = -0.50         # Stop Global: Corta o balde com 50% de perda na margem agregada
 
     BASKET_BREAKEVEN_TRIGGER_PCT: float = 0.25  # Armar Catraca: Aciona com 25% de lucro no balde
-    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.05   # Piso da Catraca: Garante 5% de lucro mínimo
+    BASKET_BREAKEVEN_PROFIT_PCT: float = 0.10 # Piso da Catraca: Garante 5% de lucro mínimo
 
-    MAX_PENDING_ORDER_MINUTES: int = 5
+    MAX_PENDING_ORDER_MINUTES: int = 10
     BANCA_DEMO_INICIAL: float = 100.0
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
 
     MAX_OPEN_TRADES: int = 5
-    ALAVANCAGEM: int = 20
+    ALAVANCAGEM: int = 35
 
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (FÔLEGO PARA 20X)
