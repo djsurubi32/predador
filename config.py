@@ -38,7 +38,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
                     spread_pct = ((ask - bid) / bid) * 100
 
                     # 3. Volume mínimo de 55 milhões de dólares nas últimas 24h (Liquidez Extrema)
-                    if spread_pct <= 0.05 and volume_24h >= 40000000:
+                    if spread_pct <= 0.05 and volume_24h >= 25000000:
                         moedas_validas.append((symbol, volume_24h))
 
         moedas_validas.sort(key=lambda x: x[1], reverse=True)
@@ -65,20 +65,20 @@ class Config:
     # ---------------------------------------------------------
     # GESTÃO GLOBAL DO BALDE (SINCRONIZADO PARA 35X E 2 VELAS)
     # ---------------------------------------------------------
-    BASKET_TARGET_PCT: float = 1.40             # Alvo: 140% ROE (Equivale aos 4% de TP da IA no preço)
+    BASKET_TARGET_PCT: float = 3.0             # Alvo: 140% ROE (Equivale aos 4% de TP da IA no preço)
     BASKET_TRAILING_PULLBACK_PCT: float = 0.15  # Trailing: Recuo de 15% após atingir o alvo
     BASKET_STOP_LOSS_PCT: float = -0.90         # Stop Global: -90% ROE (Dá 2.5% de fôlego no preço. Mantém o R:R saudável sem asfixiar)
 
     BASKET_BREAKEVEN_TRIGGER_PCT: float = 0.60  # Armar Catraca: Aciona apenas com 60% de lucro (Deixa a moeda explodir sem sufocar)
     BASKET_BREAKEVEN_PROFIT_PCT: float = 0.15   # Piso da Catraca: Garante 15% de lucro mínimo caso reverta
 
-    MAX_PENDING_ORDER_MINUTES: int = 10
+    MAX_PENDING_ORDER_MINUTES: int = 5
     BANCA_DEMO_INICIAL: float = 100.0
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
 
-    MAX_OPEN_TRADES: int = 5
+    MAX_OPEN_TRADES: int = 10
     ALAVANCAGEM: int = 35
 
     # ---------------------------------------------------------
@@ -91,7 +91,7 @@ class Config:
     CORRELATION_THRESHOLD: float = 0.70
     MAX_TRADE_DURATION_MINUTES: int = 240
 
-    NUM_MOEDAS_OPERACIONAIS: int = 700
+    NUM_MOEDAS_OPERACIONAIS: int = 2000
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5
     TIMEFRAME: str = '15m'
