@@ -1,4 +1,4 @@
-import os
+⁸import os
 import time
 import logging
 import ccxt
@@ -38,7 +38,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
                     spread_pct = ((ask - bid) / bid) * 100
 
                     # 3. Volume mínimo de 55 milhões de dólares nas últimas 24h (Liquidez Extrema)
-                    if spread_pct <= 0.05 and volume_24h >= 55000000:
+                    if spread_pct <= 0.05 and volume_24h >= 40000000:
                         moedas_validas.append((symbol, volume_24h))
 
         moedas_validas.sort(key=lambda x: x[1], reverse=True)
