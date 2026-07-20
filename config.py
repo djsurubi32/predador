@@ -59,7 +59,7 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    MIN_SCORE_ENTRY: float = 8.5
+    MIN_SCORE_ENTRY: float = 6.5
     OPERA_CONTA_REAL: bool = False
 
     # ---------------------------------------------------------
