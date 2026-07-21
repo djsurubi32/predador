@@ -125,7 +125,7 @@ class BybitExecutionEngine:
                 open_trades = await db_reference.get_all_open_trades()
                 if not open_trades: return []
 
-                tickers = await asyncio.to_thread(self.public_exchange.fetch_tickers)
+                tickers = await asyncio.to_thread(self.public_exchange.fetch_tickers, [t[0] for t in open_trades])
                 active = []
 
                 for t in open_trades:
@@ -169,7 +169,8 @@ class BybitExecutionEngine:
             logging.error(f"Erro ao fechar posição a mercado {symbol}: {e}")
             return False
 
-    async def close_position_limit_chase(self, symbol: str, side: str, amount: float, max_retries: int = 5):
+    async def close_position_limit_chase(self, symbol: str, side: str, amount: float, max_retries: int = 3):
+        # 🛡️ OTIMIZAÇÃO: Menos tentativas, mais velocidade. Fuga de emergência em 35x.
         if not self.private_exchange or not self.is_real_mode: return True
         order_side = 'sell' if side.upper() in ['LONG', 'BUY'] else 'buy'
         remaining_amount = amount
@@ -182,20 +183,23 @@ class BybitExecutionEngine:
                 price_str = self.private_exchange.price_to_precision(symbol, limit_price)
 
                 order = await asyncio.to_thread(self.private_exchange.create_order, symbol, 'limit', order_side, float(amount_str), float(price_str), {'reduceOnly': True, 'postOnly': True})
-                await asyncio.sleep(3)
+                
+                # Aguarda apenas meio segundo (Alta Frequência) e não 3 segundos
+                await asyncio.sleep(0.5)
 
                 fetched_order = await asyncio.to_thread(self.private_exchange.fetch_order, order['id'], symbol, params={'acknowledged': True})
                 if fetched_order.get('status') == 'closed': return True
                 else:
                     await asyncio.to_thread(self.private_exchange.cancel_order, order['id'], symbol)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     fetched_order_after = await asyncio.to_thread(self.private_exchange.fetch_order, order['id'], symbol, params={'acknowledged': True})
                     filled = float(fetched_order_after.get('filled', 0.0))
                     remaining_amount = amount - filled
                     if remaining_amount <= 0.00001: return True
             except Exception:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
+        # Despejo absoluto a mercado se a liquidez fugir
         if remaining_amount > 0.00001:
             await self.close_position_market(symbol, side, remaining_amount)
         return True
@@ -559,6 +563,12 @@ class EngineExecutor:
             open_trades = await self.db.get_all_open_trades()
             trade_dict = {t[0]: t for t in open_trades}
 
+            # 🛡️ OTIMIZAÇÃO: Consulta vetorial simultânea na API (Fim do gargalo de rede)
+            symbols_to_fetch = [p['symbol'] for p in positions if p['symbol'] in trade_dict]
+            if not symbols_to_fetch: return
+            
+            tickers = await asyncio.to_thread(self.public_exchange.fetch_tickers, symbols_to_fetch)
+
             for p in positions:
                 symbol = p['symbol']
                 if symbol not in trade_dict:
@@ -569,8 +579,10 @@ class EngineExecutor:
                 sl_price = float(trade[5])
                 tp_price = float(trade[6])
                 
-                ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
-                current_price = float(ticker.get('last') or ticker.get('close'))
+                ticker = tickers.get(symbol, {})
+                current_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+                
+                if current_price == 0.0: continue
 
                 fechar = False
                 motivo = ""
@@ -643,23 +655,22 @@ class EngineExecutor:
         current_roe = total_net_pnl / total_margin
         max_roe = self.max_basket_pnl / total_margin
 
-        # 🛡️ VERTENTE A: TRAILING STOP INSTITUCIONAL EM FASES (Para 35x)
-        # Substitui a catraca covarde por estrangulamento agressivo de ROE (Return On Equity)
+        # 🛡️ OTIMIZAÇÃO: Catraca Móvel Recalibrada contra 'Whipsaws' (Ruídos de Mercado)
         
         stop_dinamico_usd = -total_margin * 0.40  # Hard stop da cesta (Limite máximo de 40% de perda sobre a margem)
         fase_catraca = "INATIVA"
         
         if max_roe >= 0.50:
-            # FASE 3 (Asfixia Extrema): Acima de 50% de ROE, permite apenas 5% de recuo absoluto.
-            stop_dinamico_usd = (max_roe - 0.05) * total_margin
+            # FASE 3 (Asfixia Final): Permite um recuo de 15% de ROE (Trava o lucro em +35% ROE)
+            stop_dinamico_usd = (max_roe - 0.15) * total_margin
             fase_catraca = "ASFIXIA (Fase 3)"
         elif max_roe >= 0.30:
-            # FASE 2 (Fixação): Acima de 30% de ROE, permite 10% de recuo.
-            stop_dinamico_usd = (max_roe - 0.10) * total_margin
+            # FASE 2 (Fixação): Permite um recuo de 15% de ROE (Trava o lucro em +15% ROE)
+            stop_dinamico_usd = (max_roe - 0.15) * total_margin
             fase_catraca = "FIXAÇÃO (Fase 2)"
         elif max_roe >= 0.15:
-            # FASE 1 (Break-Even Dinâmico): Acima de 15% de ROE, trava em lucro garantido (+5% ROE).
-            stop_dinamico_usd = 0.05 * total_margin
+            # FASE 1 (Break-Even Dinâmico): Trava no lucro raso (+2% ROE) apenas para garantir o pagamento de taxas da Bybit.
+            stop_dinamico_usd = 0.02 * total_margin
             fase_catraca = "BREAK-EVEN (Fase 1)"
 
         acao = None
@@ -697,6 +708,7 @@ class EngineExecutor:
                 amount = float(p.get('contracts', 0))
                 if amount > 0:
                     logging.info(f"Fechando {symbol} ({side}) - Catraca Global")
+                    # Se atingir o trailing stop, nós agredimos rápido o limite com fuga garantida a mercado
                     await self.execution.close_position_limit_chase(symbol, side, amount)
 
                 await self.db.remove_trade(symbol)
@@ -736,6 +748,7 @@ class EngineExecutor:
         buy_positions_count = sum(1 for p in positions if p['side'] in ['LONG', 'BUY'])
         sell_positions_count = sum(1 for p in positions if p['side'] in ['SHORT', 'SELL'])
 
+        # Centralizando chamadas macro para evitar saturação de API
         btc_trend = await self.check_btc_trend_1h()
 
         for signal in signals:
