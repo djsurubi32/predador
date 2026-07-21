@@ -1,40 +1,23 @@
 import sys
-import os
 import time
 import logging
 import asyncio
 import threading
-import ccxt
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from config import Config
 from treinador import MotorTreinamento
-from analisador import AnalisadorRadar
+from analisador import RadarCore  # CORREÇÃO: Nome e importação corretos
 from executor import EngineExecutor
+from keep_alive import keep_alive # CORREÇÃO: Utilizando o seu módulo modularizado
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-
-# Escudo Anti-Crash (Keep-Alive)
-class KeepAliveHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Predador Quantitativo Online")
-
-    def log_message(self, format, *args):
-        # Desativa o log de requisições web para não poluir o terminal
-        pass
-
-def run_keep_alive():
-    try:
-        server = HTTPServer(('0.0.0.0', 8080), KeepAliveHandler)
-        logging.info("🛡️ Escudo Anti-Crash (Healthcheck) ativado na porta 8080")
-        server.serve_forever()
-    except Exception as e:
-        logging.error(f"Erro no Escudo Anti-Crash: {e}")
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s', 
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 def run_treinador_loop():
+    """Thread Síncrona: Treina os modelos de IA e hiberna."""
     treinador = MotorTreinamento()
     while True:
         try:
@@ -44,47 +27,48 @@ def run_treinador_loop():
             logging.error(f"Erro Crítico no Loop do Treinador: {e}")
             time.sleep(60)
 
-def run_radar_loop(public_exchange):
-    # É fundamental criar um novo event loop para a thread do Radar assíncrono
+def run_radar_loop():
+    """Thread Assíncrona: Varre o mercado 24/7 alimentando o banco de dados (Sinais)."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    radar = AnalisadorRadar(public_exchange)
+    
+    # O RadarCore agora usa o seu próprio pool otimizado de conexões HTTP (Sem injeção externa)
+    radar = RadarCore() 
     try:
-        loop.run_until_complete(radar.loop_radar())
+        # CORREÇÃO: Chamando o método real do analisador
+        loop.run_until_complete(radar.scan_market()) 
     except Exception as e:
         logging.error(f"Erro Crítico no Loop do Radar: {e}")
 
 def main():
-    logging.info("A ativar o Escudo Anti-Crash (Keep-Alive)...")
-    threading.Thread(target=run_keep_alive, daemon=True, name="Thread-KeepAlive").start()
+    logging.info("🛡️ Iniciando ecossistema Predador 2.0...")
+    
+    # 1. Ativa o Escudo Anti-Crash (Healthcheck da VPS)
+    keep_alive()
 
-    # 1. Inicializa a conexão pública da corretora para o Radar e Executor
-    public_exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+    # 2. Inicia o Cérebro Institucional (Treinador de IA)
+    logging.info("🧠 Ligando Motor de Machine Learning (Treinador)...")
+    threading.Thread(target=run_treinador_loop, daemon=True, name="Treinador").start()
 
-    # 2. Inicia o Cérebro Institucional (Treinador) em uma thread dedicada e síncrona
-    logging.info("A iniciar a thread do Treinador de IA...")
-    threading.Thread(target=run_treinador_loop, daemon=True, name="Thread-Treinador").start()
-
-    # 3. Pequena pausa para garantir que os modelos iniciais de IA sejam validados
+    # Breve pausa para garantir que o modelo inicie a alocação de memória com segurança
     time.sleep(5)
 
-    # 4. Inicia o Radar (Analisador) em uma thread assíncrona dedicada
-    logging.info("A iniciar a thread do Analisador (Radar)...")
-    threading.Thread(target=run_radar_loop, args=(public_exchange,), daemon=True, name="Thread-Radar").start()
+    # 3. Inicia o Motor de Varredura (Radar)
+    logging.info("📡 Ligando Motor de Varredura Quantitativa (Radar)...")
+    threading.Thread(target=run_radar_loop, daemon=True, name="Radar").start()
 
-    # 5. Pequena pausa para garantir que o Radar limpe o banco e comece a gravar os sinais limpos
     time.sleep(3)
 
-    # 6. Inicia o Executor de Ordens na thread principal (Main Thread)
-    logging.info("A iniciar o Executor de Ordens (Main Thread)...")
+    # 4. Inicia o Motor de Execução Institucional (Na Main Thread)
+    logging.info("⚡ Ligando Motor de Execução e Catraca Elástica...")
     executor = EngineExecutor()
     try:
         asyncio.run(executor.start_execution_loop())
     except KeyboardInterrupt:
-        logging.info("🛑 Sistema encerrado pelo usuário.")
+        logging.info("🛑 Sistema Predador encerrado pelo usuário.")
 
 if __name__ == '__main__':
-    # Otimização de plataforma para Windows (se rodar fora da VPS)
+    # Otimização assíncrona mandatória para ambientes Windows
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     main()
