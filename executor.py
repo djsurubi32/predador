@@ -59,7 +59,7 @@ class BybitExecutionEngine:
             except Exception as e:
                 logging.error(f"❌ Erro ao inicializar mercados na corretora: {e}")
 
-    async def set_leverage(self, symbol: str, leverage: int = 50):
+    async def set_leverage(self, symbol: str, leverage: int = 35):
         if not self.private_exchange or not self.is_real_mode: return True
         try:
             await asyncio.to_thread(self.private_exchange.set_leverage, leverage, symbol)
@@ -161,7 +161,7 @@ class BybitExecutionEngine:
     async def close_position_market(self, symbol: str, side: str, amount: float):
         if not self.private_exchange or not self.is_real_mode: return True
         try:
-            order_side = 'sell' if side.upper() == 'BUY' else 'buy'
+            order_side = 'sell' if side.upper() in ['LONG', 'BUY'] else 'buy'
             amount_str = self.private_exchange.amount_to_precision(symbol, amount)
             await asyncio.to_thread(self.private_exchange.create_order, symbol, 'market', order_side, float(amount_str), None, {'reduceOnly': True})
             return True
@@ -171,7 +171,7 @@ class BybitExecutionEngine:
 
     async def close_position_limit_chase(self, symbol: str, side: str, amount: float, max_retries: int = 5):
         if not self.private_exchange or not self.is_real_mode: return True
-        order_side = 'sell' if side.upper() == 'BUY' else 'buy'
+        order_side = 'sell' if side.upper() in ['LONG', 'BUY'] else 'buy'
         remaining_amount = amount
 
         for attempt in range(max_retries):
@@ -347,16 +347,9 @@ class EngineExecutor:
 
         self.max_basket_pnl = 0.0
         self.min_basket_pnl = 0.0
-        self.last_global_status_time = time.time()
         self.last_empty_heartbeat = time.time()
         self.last_summary_time = time.time()
         self.simulated_banca = float(Config.BANCA_DEMO_INICIAL)
-
-        self.f_target = float(Config.BASKET_TARGET_PCT)
-        self.f_pullback = float(Config.BASKET_TRAILING_PULLBACK_PCT)
-        self.f_stop = float(Config.BASKET_STOP_LOSS_PCT)
-        self.f_breakeven_trigger = float(Config.BASKET_BREAKEVEN_TRIGGER_PCT)
-        self.f_breakeven_profit = float(Config.BASKET_BREAKEVEN_PROFIT_PCT)
 
     def route_and_calculate_strategy(self, opp):
         score = float(opp['score'])
@@ -366,38 +359,38 @@ class EngineExecutor:
         is_fluxo_maximo = "Fluxo:3.0" in reasoning_clean
         is_espaco_expandido = "ML_Espaço:3.0" in reasoning_clean
 
-        # 🛡️ AJUSTE ESTRUTURAL (Alavancagem 20x): Maior fôlego de SL para buscar alvos exponenciais
+        # 🛡️ AJUSTE ESTRUTURAL (Alavancagem 35x): Distâncias encurtadas para proteger contra liquidação
         if score >= 9.0 and prob >= 75.0:
             return {
                 "vertente": "QUALIDADE EXTREMA (SNIPER)",
                 "lote_tipo": "Lote Sniper",
                 "invest_amount": 6.0,
-                "tp_factor": 1.050,  # Busca 5% de movimento na moeda (100% de lucro sobre a margem a 20x)
-                "sl_factor": 0.970   # Tolera 3% de oscilação contra (perda de 60% da margem alocada)
+                "tp_factor": 1.025,  # Busca 2.5% de movimento na moeda (ROE 87.5% a 35x)
+                "sl_factor": 0.990   # Tolera apenas 1.0% de oscilação contra (perda de 35% da margem)
             }
         elif is_fluxo_maximo:
             return {
                 "vertente": "SCALPING DE MOMENTUM",
                 "lote_tipo": "Lote Padrão",
                 "invest_amount": 4.0,
-                "tp_factor": 1.020,  # Busca 2% de movimento (40% de lucro a 20x)
-                "sl_factor": 0.985   # Tolera 1.5% de oscilação contra
+                "tp_factor": 1.015,  # Busca 1.5% de movimento (ROE 52.5% a 35x)
+                "sl_factor": 0.992   # Tolera apenas 0.8% de oscilação contra
             }
         elif is_espaco_expandido:
             return {
                 "vertente": "DAY TRADE DE EXPANSÃO",
                 "lote_tipo": "Lote Leve",
                 "invest_amount": 3.0,
-                "tp_factor": 1.060,  # Busca 6% de movimento (120% de lucro a 20x)
-                "sl_factor": 0.960   # Tolera 4% de oscilação contra
+                "tp_factor": 1.020,  # Busca 2.0% de movimento (ROE 70% a 35x)
+                "sl_factor": 0.988   # Tolera 1.2% de oscilação contra
             }
 
         return {
             "vertente": "PADRÃO ADAPTATIVO",
             "lote_tipo": "Lote de Teste",
             "invest_amount": 2.0,
-            "tp_factor": 1.030,  # Busca 3% de movimento (60% de lucro a 20x)
-            "sl_factor": 0.975   # Tolera 2.5% de oscilação contra
+            "tp_factor": 1.012,  # Busca 1.2% de movimento (ROE 42% a 35x)
+            "sl_factor": 0.993   # Tolera 0.7% de oscilação contra
         }
 
     async def check_btc_trend_1h(self) -> str:
@@ -642,51 +635,52 @@ class EngineExecutor:
 
         if total_margin <= 0: return
 
-        alvo_dinamico = total_margin * self.f_target
-        pullback_dinamico = total_margin * self.f_pullback
-        stop_dinamico = total_margin * self.f_stop 
-
-        gatilho_breakeven = total_margin * self.f_breakeven_trigger
-        lucro_garantido_breakeven = total_margin * self.f_breakeven_profit
-        passo_avanco = total_margin * 0.0025
-
         if total_net_pnl > self.max_basket_pnl:
             self.max_basket_pnl = total_net_pnl
         if total_net_pnl < self.min_basket_pnl:
             self.min_basket_pnl = total_net_pnl
 
-        breakeven_ativo = False
-        if self.max_basket_pnl >= gatilho_breakeven:
-            lucro_excedente = self.max_basket_pnl - gatilho_breakeven
-            degraus_avancados = math.floor(lucro_excedente / passo_avanco) if passo_avanco > 0 else 0
-            stop_dinamico = lucro_garantido_breakeven + (degraus_avancados * (total_margin * 0.00125)) 
-            breakeven_ativo = True
+        current_roe = total_net_pnl / total_margin
+        max_roe = self.max_basket_pnl / total_margin
+
+        # 🛡️ VERTENTE A: TRAILING STOP INSTITUCIONAL EM FASES (Para 35x)
+        # Substitui a catraca covarde por estrangulamento agressivo de ROE (Return On Equity)
+        
+        stop_dinamico_usd = -total_margin * 0.40  # Hard stop da cesta (Limite máximo de 40% de perda sobre a margem)
+        fase_catraca = "INATIVA"
+        
+        if max_roe >= 0.50:
+            # FASE 3 (Asfixia Extrema): Acima de 50% de ROE, permite apenas 5% de recuo absoluto.
+            stop_dinamico_usd = (max_roe - 0.05) * total_margin
+            fase_catraca = "ASFIXIA (Fase 3)"
+        elif max_roe >= 0.30:
+            # FASE 2 (Fixação): Acima de 30% de ROE, permite 10% de recuo.
+            stop_dinamico_usd = (max_roe - 0.10) * total_margin
+            fase_catraca = "FIXAÇÃO (Fase 2)"
+        elif max_roe >= 0.15:
+            # FASE 1 (Break-Even Dinâmico): Acima de 15% de ROE, trava em lucro garantido (+5% ROE).
+            stop_dinamico_usd = 0.05 * total_margin
+            fase_catraca = "BREAK-EVEN (Fase 1)"
 
         acao = None
         motivo = ""
         lucro_final = total_net_pnl
 
-        if total_net_pnl <= stop_dinamico:
+        if total_net_pnl <= stop_dinamico_usd:
             acao = "FECHAR_TUDO"
-            if breakeven_ativo:
+            if fase_catraca != "INATIVA":
                 motivo = (
                     f"🔵 CATRACA MÓVEL ACIONADA [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
-                    f"Proteção elástica executada.\n"
+                    f"Fase Ativa: {fase_catraca}\n"
+                    f"Proteção elástica executada com precisão no ROE.\n"
                     f"Resultado líquido: ${lucro_final:.2f}"
                 )
             else:
                 motivo = (
                     f"🛑 STOP LOSS DO BALDE ACIONADO [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
-                    f"Cortando perdas líquidas agregadas em: ${lucro_final:.2f}"
+                    f"Cortando perdas agregadas (Hard Stop de Proteção).\n"
+                    f"Resultado líquido: ${lucro_final:.2f}"
                 )
-
-        elif self.max_basket_pnl >= alvo_dinamico and (self.max_basket_pnl - total_net_pnl) >= pullback_dinamico:
-            acao = "FECHAR_TUDO"
-            motivo = (
-                f"🎯 TRAILING GLOBAL ATIVADO [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
-                f"Esvaziando balde adaptativo.\n"
-                f"Resultado LÍQUIDO líquido: ${lucro_final:.2f}"
-            )
 
         if acao == "FECHAR_TUDO":
             if not Config.OPERA_CONTA_REAL:
@@ -702,7 +696,7 @@ class EngineExecutor:
                 side = p['side']
                 amount = float(p.get('contracts', 0))
                 if amount > 0:
-                    logging.info(f"Fechando {symbol} ({side}) - Chase")
+                    logging.info(f"Fechando {symbol} ({side}) - Catraca Global")
                     await self.execution.close_position_limit_chase(symbol, side, amount)
 
                 await self.db.remove_trade(symbol)
@@ -714,18 +708,16 @@ class EngineExecutor:
         elif acao is None and (now - self.last_summary_time >= 600):
             self.last_summary_time = now
             modo_texto = "CONTA REAL" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO"
-            status_catraca = "🟢 ATIVA" if breakeven_ativo else "🔴 INATIVA"
-
+            
             resumo_msg = (
                 f"⏱️ <b>RAIO-X DO BALDE (10 min)</b> [{modo_texto}]\n\n"
                 f"🔹 <b>Operações:</b> {len(positions)}/{Config.MAX_OPEN_TRADES}\n"
                 f"🔹 <b>Margem Alocada:</b> ${total_margin:.2f}\n"
-                f"🔹 <b>PnL Atual:</b> ${total_net_pnl:.2f}\n\n"
-                f"📈 <b>Topo (Max PnL):</b> ${self.max_basket_pnl:.2f}\n"
+                f"🔹 <b>PnL Atual:</b> ${total_net_pnl:.2f} ({current_roe * 100:.1f}% ROE)\n\n"
+                f"📈 <b>Topo (Max PnL):</b> ${self.max_basket_pnl:.2f} ({max_roe * 100:.1f}% ROE)\n"
                 f"📉 <b>Fundo (Min PnL):</b> ${self.min_basket_pnl:.2f}\n\n"
-                f"🎯 <b>Alvo Global:</b> ${alvo_dinamico:.2f}\n"
-                f"🛑 <b>Stop Global:</b> ${stop_dinamico:.2f}\n"
-                f"🔒 <b>Catraca:</b> {status_catraca}"
+                f"🔒 <b>Catraca:</b> {fase_catraca}\n"
+                f"🛑 <b>Gatilho de Fechamento em:</b> ${stop_dinamico_usd:.2f}"
             )
             await TelegramLogger.send(resumo_msg)
 
@@ -813,8 +805,15 @@ class EngineExecutor:
 
             qty = (amount_to_invest * Config.ALAVANCAGEM) / current_price
 
-            tp_price = current_price * strategy["tp_factor"] if direction == 'BUY' else current_price / strategy["tp_factor"]
-            sl_price = current_price * strategy["sl_factor"] if direction == 'BUY' else current_price / strategy["sl_factor"]
+            # 🛡️ REVERSÃO MATEMÁTICA CORRETA PARA SHORTS (Bidirecionalidade Cripto)
+            if direction == 'BUY':
+                tp_price = current_price * strategy["tp_factor"]
+                sl_price = current_price * strategy["sl_factor"]
+            else:
+                dist_tp = strategy["tp_factor"] - 1.0
+                dist_sl = 1.0 - strategy["sl_factor"]
+                tp_price = current_price * (1.0 - dist_tp)
+                sl_price = current_price * (1.0 + dist_sl)
 
             try:
                 if Config.OPERA_CONTA_REAL:
@@ -830,28 +829,18 @@ class EngineExecutor:
                 else:
                     sell_positions_count += 1
 
-                open_trades_after = await self.db.get_all_open_trades()
-                total_margin = sum((float(t[3]) * float(t[2])) / Config.ALAVANCAGEM for t in open_trades_after)
-                
-                alvo_atual = total_margin * self.f_target
-                stop_atual = total_margin * self.f_stop
-
                 banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
 
                 modo_texto = "CONTA REAL" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO"
                 msg = (
                     f"🔬 [{modo_texto}] ORDEM DETECTADA | {strategy['vertente']}\n\n"
-                    f"Ativo: {symbol}, direção: {direction}\n"
+                    f"Ativo: {symbol} | Direção: {direction}\n"
                     f"Valor alocado: ${amount_to_invest:.2f} ({strategy['lote_tipo']})\n"
-                    f"Score: {signal['score']:.1f}/10.0 | probabilidade: {signal['prob']:.1f}%\n"
+                    f"Score: {signal['score']:.1f}/10.0 | Probabilidade: {signal['prob']:.1f}%\n"
                     f"Ml: {signal['reasoning']}\n"
                     f"Oráculo Binance: {oraculo_motivo}\n"
                     f"Batedor Bybit: Validado Local ({bybit_motivo})\n"
-                    f"Saldo da banca: ${banca_atual:.2f}\n\n"
-                    f"📊 <b>STATUS DO BALDE:</b>\n"
-                    f"Margem Total: ${total_margin:.2f}\n"
-                    f"Alvo TP: ${alvo_atual:.2f}\n"
-                    f"Risco SL: ${stop_atual:.2f}"
+                    f"Saldo da banca: ${banca_atual:.2f}"
                 )
 
                 await TelegramLogger.send(msg)
@@ -874,7 +863,7 @@ class EngineExecutor:
         modo = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO/DEMO 🔬"
         msg_inicio = (
             f"🚀 PREDADOR QUANTITATIVO ONLINE\n"
-            f"O motor executor foi iniciado com sucesso!\n"
+            f"O motor executor bidirecional foi iniciado com sucesso!\n"
             f"Modo Operacional: {modo}\n"
             f"Alavancagem Fixa: {Config.ALAVANCAGEM}x\n"
             f"Limite do Balde: {Config.MAX_OPEN_TRADES} trades simultâneos.\n"
