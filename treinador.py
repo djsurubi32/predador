@@ -52,29 +52,44 @@ class MotorTreinamento:
         if not ativos: return []
         
         if time.time() - self.btc_train_time > 3600 or not self.btc_train_cache:
+            logging.info("Sincronizando benchmark temporal (BTC) com paginação profunda...")
             self.btc_train_cache = self.fetch_historical_sync(ativos[0], Config.CANDLES_TREINAMENTO_ML)
             self.btc_train_time = time.time()
         return self.btc_train_cache
 
     def fetch_historical_sync(self, symbol, limit):
+        """
+        🚀 OTIMIZAÇÃO: Motor de Paginação Profunda. 
+        Burla o limite de 1000 velas da Bybit e força o download da matriz completa de treinamento.
+        """
         try:
-            # 🛡️ FIX INSTITUCIONAL: Acelerador controlado para respeitar a Bybit
-            time.sleep(1.5) 
+            all_ohlcv = []
+            # Calcula o timestamp de início baseado no limite e timeframe de 15m
+            since_ms = int((time.time() - (limit * 15 * 60)) * 1000)
             
-            ohlcv = self.exchange.fetch_ohlcv(symbol, Config.TIMEFRAME, limit=limit)
+            while len(all_ohlcv) < limit:
+                time.sleep(0.2) # Acelerador respeitoso (Rate Limit)
+                batch = self.exchange.fetch_ohlcv(symbol, Config.TIMEFRAME, since=since_ms, limit=1000)
+                if not batch or len(batch) == 0:
+                    break
+                
+                since_ms = batch[-1][0] + 1
+                all_ohlcv.extend(batch)
             
-            # Extração de Open Interest (Contratos Abertos)
+            all_ohlcv = all_ohlcv[-limit:] # Garante o corte exato
+
+            # Extração de Open Interest com Paginação Simplificada
             try:
                 time.sleep(0.5) 
-                oi_data = self.exchange.fetch_open_interest_history(symbol, Config.TIMEFRAME, limit=limit)
+                oi_data = self.exchange.fetch_open_interest_history(symbol, Config.TIMEFRAME, limit=1000)
                 oi_map = {int(item.get('timestamp', 0)): float(item.get('openInterestValue') or item.get('info', {}).get('openInterest', 0)) for item in oi_data}
             except Exception:
                 oi_map = {}
 
-            # Extração de Funding Rate (Taxa de Financiamento - Caça à Liquidez)
+            # Extração de Funding Rate
             try:
                 time.sleep(0.5)
-                fr_data = self.exchange.fetch_funding_rate_history(symbol, limit=limit)
+                fr_data = self.exchange.fetch_funding_rate_history(symbol, limit=1000)
                 fr_map = {int(item.get('timestamp', 0)): float(item.get('fundingRate', 0)) for item in fr_data}
             except Exception:
                 fr_map = {}
@@ -82,7 +97,7 @@ class MotorTreinamento:
             merged = []
             last_oi = 0.0
             last_fr = 0.0
-            for bar in ohlcv:
+            for bar in all_ohlcv:
                 ts = int(bar[0])
                 if oi_map.get(ts, 0.0) != 0.0:
                     last_oi = oi_map.get(ts, 0.0)
@@ -122,7 +137,6 @@ class MotorTreinamento:
         vol_mean, vol_std = df['volume'].rolling(20).mean(), df['volume'].rolling(20).std()
         df['vol_zscore'] = (df['volume'] - vol_mean) / (vol_std + 1e-9)
         
-        # Criação segura do EMA_20, caso falte da biblioteca customizada
         if 'EMA_20' not in df.columns:
             df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
         df['price_vs_ema'] = df['close'] - df['EMA_20']
@@ -153,19 +167,15 @@ class MotorTreinamento:
             df['oi_change'] = 0.0; df['oi_trend'] = 0.0; df['oi_price_divergence'] = 0.0
 
         # ====================================================================================
-        # 🚀 INÍCIO DOS 15 SENSORES QUANTITATIVOS INSTITUCIONAIS
+        # INJEÇÃO DOS 15 SENSORES QUANTITATIVOS INSTITUCIONAIS
         # ====================================================================================
-
-        # 1. Divergência OBV vs. RSI (Volume vs Força Relativa)
         df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
         df['obv_slope'] = df['obv'].diff(3).fillna(0.0)
         df['obv_rsi_div'] = np.where((df['obv_slope'] > 0) & (df['rsi_slope'] < 0), 1.0,
                             np.where((df['obv_slope'] < 0) & (df['rsi_slope'] > 0), -1.0, 0.0))
 
-        # 2. Aceleração do CVD (Segunda Derivada do Delta de Volume)
         df['cvd_accel'] = df['cvd'].diff(3).diff(3).fillna(0.0)
 
-        # 3. Distância da VWAP Ancorada (Preço Justo Diário)
         df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
         df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
         df['vol_price'] = df['volume'] * df['typical_price']
@@ -175,46 +185,36 @@ class MotorTreinamento:
         df['vwap'] = df['cum_vol_price'] / (df['cum_vol'] + 1e-9)
         df['vwap_dist'] = ((df['close'] - df['vwap']) / (df['vwap'] + 1e-9)).fillna(0.0)
 
-        # 4. Vácuo de Liquidez (Dinâmica do Spread Proxy)
         df['liq_vacuum'] = ((df['high'] - df['low']) / (df['volume'] + 1e-9)).rolling(10).mean().fillna(0.0)
 
-        # 5. Variação do Funding Rate (Ataque ao Varejo)
         if 'funding_rate' in df.columns:
             df['funding_rate'] = df['funding_rate'].replace(0, np.nan).ffill().fillna(0.0)
             df['funding_rate_delta'] = df['funding_rate'].diff(3).fillna(0.0)
         else:
             df['funding_rate_delta'] = 0.0
 
-        # 6. Momentum de Open Interest (Velocidade de Contratos)
         if 'open_interest' in df.columns:
             df['oi_momentum'] = (df['open_interest'].diff(5) / (df['open_interest'].rolling(20).mean() + 1e-9)).fillna(0.0)
         else:
             df['oi_momentum'] = 0.0
 
-        # 7. Smart Money Proxy (Negative Volume Index - NVI)
         vol_drop = df['volume'] < df['volume'].shift(1)
         roc = df['close'].pct_change().fillna(0.0)
         df['nvi'] = (vol_drop * roc).cumsum().fillna(0.0)
 
-        # 8. Expoente de Hurst (Mapeamento de Regimes: Tendência vs Lateral)
         lag1_var = df['log_return'].rolling(20).var().fillna(0.0)
         lag5_var = df['close'].pct_change(5).rolling(20).var().fillna(0.0)
         df['hurst_proxy'] = (np.log(lag5_var + 1e-9) / np.log(lag1_var + 1e-9)).fillna(0.0)
 
-        # 9. Z-Score (Extremos Matemáticos do Preço)
         df['z_score_50'] = ((df['close'] - df['close'].rolling(50).mean()) / (df['close'].rolling(50).std() + 1e-9)).fillna(0.0)
-
-        # 10. Autocorrelação de Retornos (Memória do Mercado)
         df['autocorr_3'] = df['log_return'].rolling(20).apply(lambda x: x.autocorr(lag=3) if len(x.dropna()) > 3 else 0, raw=False).fillna(0.0)
 
-        # 11. Dimensão Fractal (Caos vs Estrutura)
         n_period = 20
         high_max = df['high'].rolling(n_period).max()
         low_min = df['low'].rolling(n_period).min()
         path_length = np.abs(df['close'].diff()).rolling(n_period).sum()
         df['fractal_dim'] = (np.log(path_length + 1e-9) / np.log((high_max - low_min) + 1e-9)).fillna(0.0)
 
-        # 12. Squeeze Keltner/Bollinger (O Efeito Mola)
         atr_14 = df.get('ATRr_14', df['close'].rolling(14).std())
         df['kc_upper'] = df['EMA_20'] + (1.5 * atr_14)
         df['kc_lower'] = df['EMA_20'] - (1.5 * atr_14)
@@ -222,37 +222,23 @@ class MotorTreinamento:
         kc_width = df['kc_upper'] - df['kc_lower']
         df['squeeze_ratio'] = (bb_width / (kc_width + 1e-9)).fillna(1.0)
 
-        # 13. ATR Normalizado (Combustível Absoluto)
         df['natr'] = ((atr_14 / df['close']) * 100).fillna(0.0)
-
-        # 14. Skewness de Retornos (Assimetria do Medo/Ganância)
         df['skewness_20'] = df['log_return'].rolling(20).skew().fillna(0.0)
 
-        # 15. Velocidade do Histograma MACD
         ema9_macd = df['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
         df['macd_hist'] = df['MACD_12_26_9'] - ema9_macd
         df['macd_hist_vel'] = df['macd_hist'].diff(2).fillna(0.0)
 
-        # Limpeza rápida das colunas extras geradas
         df.drop(columns=['typical_price', 'vol_price', 'date_only', 'cum_vol_price', 'cum_vol', 'vwap', 'obv', 'obv_slope', 'kc_upper', 'kc_lower', 'macd_hist'], inplace=True, errors='ignore')
 
-        # ====================================================================================
-        # FIM DA INJEÇÃO DOS 15 SENSORES QUANTITATIVOS
-        # ====================================================================================
-
         df_indexed = df.set_index('datetime')
-
-        df_1h = df_indexed['close'].resample('1h').last().to_frame(name='close_1h')
-        df_1h.ffill(inplace=True)
+        df_1h = df_indexed['close'].resample('1h').last().to_frame(name='close_1h').ffill()
         df_1h['ema_20_1h'] = df_1h['close_1h'].ewm(span=20, adjust=False).mean()
-
-        df_4h = df_indexed['close'].resample('4h').last().to_frame(name='close_4h')
-        df_4h.ffill(inplace=True)
+        df_4h = df_indexed['close'].resample('4h').last().to_frame(name='close_4h').ffill()
         df_4h['ema_20_4h'] = df_4h['close_4h'].ewm(span=20, adjust=False).mean()
 
         df_indexed = df_indexed.join(df_1h[['ema_20_1h']], how='left').ffill()
         df_indexed = df_indexed.join(df_4h[['ema_20_4h']], how='left').ffill()
-
         df_indexed.reset_index(drop=True, inplace=True)
         df = df_indexed
 
@@ -287,13 +273,13 @@ class MotorTreinamento:
             entry, tp, sl = closes[i], closes[i] * tp_pct, closes[i] * sl_pct
             for j in range(1, horizon + 1):
                 if highs[i + j] >= tp: 
-                    targets[i] = 1
+                    targets[i] = 1 # Rompimento Comprador (BUY)
                     break
                 elif lows[i + j] <= sl: 
-                    targets[i] = 2
+                    targets[i] = 2 # Rompimento Vendedor (SELL)
                     break
             if np.isnan(targets[i]):
-                targets[i] = 0 
+                targets[i] = 0 # Indefinição / Tempo esgotado
                 
         df['target'] = targets
         return df
@@ -317,9 +303,10 @@ class MotorTreinamento:
             return f"⚠️ Alvos insuficientes após purga em {symbol}."
 
         df['target'] = df['target'].astype(int)
+        
+        # Garante a existência das 3 classes para o algoritmo funcionar bidirecionalmente
         classes_presentes = set(df['target'].unique())
         classes_necessarias = {0, 1, 2}
-        
         classes_faltantes = classes_necessarias - classes_presentes
         if classes_faltantes:
             linhas_dummy = []
@@ -330,6 +317,7 @@ class MotorTreinamento:
             df = pd.concat([df] + linhas_dummy, ignore_index=True)
             df['target'] = df['target'].astype(int)
 
+        # Treinamento do HMM (Regimes de Mercado)
         hmm_model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42, min_covar=1e-3)
         try:
             with warnings.catch_warnings():
@@ -340,30 +328,54 @@ class MotorTreinamento:
             hmm_model = DummyHMM() 
             df['hmm_regime'] = 0
 
-        # INJEÇÃO DAS NOVAS COLUNAS NA MATRIZ DE APRENDIZADO
         features = [
             'RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos', 'ADX_14', 
             'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence', 'cvd_trend', 'oi_change', 
             'oi_trend', 'oi_price_divergence', 'mtf_dist_1h', 'mtf_dist_4h', 'btc_log_return', 
             'btc_correlation', 'noise_index',
-            # --- Novos 15 Sensores ---
             'obv_rsi_div', 'cvd_accel', 'vwap_dist', 'liq_vacuum', 'funding_rate_delta', 
             'oi_momentum', 'nvi', 'hurst_proxy', 'z_score_50', 'autocorr_3', 
             'fractal_dim', 'squeeze_ratio', 'natr', 'skewness_20', 'macd_hist_vel'
         ]
-        X, y = df[features], df['target'].astype(int)
+        X, y = df[features], df['target']
 
-        lgbm = lgb.LGBMClassifier(n_estimators=120, learning_rate=0.05, max_depth=6, num_leaves=31, random_state=42, verbose=-1, n_jobs=-1)
-        xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42, eval_metric='mlogloss', n_jobs=-1)
-        cb_model = CatBoostClassifier(iterations=120, learning_rate=0.05, depth=5, silent=True, random_state=42, thread_count=-1)
+        # 🚀 OTIMIZAÇÃO: Time-Series Split (Hold-out Validation)
+        # Proteção absoluta contra overfitting e decoragem de mercado passado.
+        split_idx = int(len(X) * 0.8) # Treina com 80%, valida com 20%
+        X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
 
-        lgbm.fit(X, y)
-        xgb_model.fit(X, y)
-        cb_model.fit(X, y)
+        # 🚀 OTIMIZAÇÃO: Hiperparâmetros Institucionais (L1/L2 Regularization e Balanceamento)
+        lgbm = lgb.LGBMClassifier(
+            n_estimators=150, learning_rate=0.03, max_depth=6, num_leaves=31, 
+            class_weight='balanced', # Resolve o desbalanceamento quantitativo
+            reg_alpha=0.1, reg_lambda=0.1, # Trava o Overfitting
+            random_state=42, verbose=-1, n_jobs=-1
+        )
+        
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=150, learning_rate=0.03, max_depth=5, 
+            early_stopping_rounds=15, # Para se não melhorar na validação
+            random_state=42, eval_metric='mlogloss', n_jobs=-1
+        )
+        
+        cb_model = CatBoostClassifier(
+            iterations=150, learning_rate=0.03, depth=5, 
+            auto_class_weights='Balanced', # Força foco em Longs e Shorts
+            l2_leaf_reg=3.0, early_stopping_rounds=15,
+            silent=True, random_state=42, thread_count=-1
+        )
 
+        # Treinamento com Early Stopping
+        lgbm.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)])
+        xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
+
+        # Matriz de Meta-Features extraída com as predições cegas do conjunto completo
         X_meta = np.column_stack([np.asarray(lgbm.predict_proba(X)), np.asarray(xgb_model.predict_proba(X)), np.asarray(cb_model.predict_proba(X))])
         
-        meta_learner = LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1)
+        # O Meta-Learner ganha "class_weight='balanced'" para não viciar no Neutro (0)
+        meta_learner = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42, n_jobs=-1)
         meta_learner.fit(X_meta, y)
 
         brain_data = {
@@ -379,16 +391,16 @@ class MotorTreinamento:
         file_path = os.path.join(Config.MODELS_DIR, f"{safe_symbol_name}.pkl")
         joblib.dump(brain_data, file_path)
 
-        return f"✅ Cérebro de {symbol} treinado e salvo com sucesso."
+        return f"✅ Cérebro de {symbol} forjado com alta precisão (Paginação e Anti-Overfitting aplicados)."
 
     def iniciar_ciclo_treinamento(self):
         ativos = Config.get_ativos()
-        logging.info(f"🚀 Iniciando Treinador Quantitativo 10/10 (Lote de {len(ativos)} moedas)...")
+        logging.info(f"🚀 Iniciando Forja Institucional (Lote de {len(ativos)} moedas)...")
         
         btc_data_raw = self.get_btc_data_sync()
         btc_train_df = pd.DataFrame(btc_data_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate']) if btc_data_raw else None
 
-        # 🛡️ FIX INSTITUCIONAL: Limita a 2 processos simultâneos para evitar banimento da Bybit
+        # Limita processos para não fuzilar a memória e sofrer IP Ban
         max_threads = 2 
         
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
@@ -405,7 +417,7 @@ class MotorTreinamento:
                 except Exception as exc:
                     logging.error(f"❌ Falha fatal no worker processando {symbol}: {exc}")
 
-        logging.info(f"💤 Treinamento concluído. O motor vai hibernar por {Config.HORAS_RETREINO} horas.")
+        logging.info(f"💤 Treinamento blindado concluído. O motor vai hibernar por {Config.HORAS_RETREINO} horas.")
 
 def main():
     treinador = MotorTreinamento()
@@ -422,4 +434,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         logging.info("🛑 Treinador encerrado pelo usuário.")
-            
