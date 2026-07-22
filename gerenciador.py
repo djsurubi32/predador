@@ -34,10 +34,8 @@ class GerenciadorRiscoAutonomo:
         # 1. Alavancagem Dinâmica Inteligente (Baseada na Volatilidade e Score)
         atr_pct = (current_atr / price) * 100
         if atr_pct > 2.5:
-            # Ativo extremamente volátil/perigoso: Reduz a alavancagem para preservar a margem
             leverage = max(15, int(Config.ALAVANCAGEM * 0.5))
         elif score >= 9.0 and prob >= 75.0:
-            # Sinal de Elite (Sniper): Alavancagem Máxima Institucional
             leverage = int(Config.ALAVANCAGEM)
         else:
             leverage = int(Config.ALAVANCAGEM)
@@ -46,8 +44,8 @@ class GerenciadorRiscoAutonomo:
         if score >= 9.0 and prob >= 75.0:
             invest_amount = 6.0  # Lote Sniper Pesado
             vertente = "QUALIDADE EXTREMA (SNIPER)"
-            atr_multi_tp = 2.5   # Alvo estendido para sinais fortes
-            atr_multi_sl = 1.2   # Stop técnico curto
+            atr_multi_tp = 2.5   
+            atr_multi_sl = 1.2   
         elif "Fluxo:3.0" in signal['reasoning'].replace(" ", ""):
             invest_amount = 4.0  # Lote Padrão de Momentum
             vertente = "SCALPING DE MOMENTUM"
@@ -63,7 +61,6 @@ class GerenciadorRiscoAutonomo:
         distancia_tp = current_atr * atr_multi_tp
         distancia_sl = current_atr * atr_multi_sl
 
-        # Proteção matemática para evitar stops maiores que a margem de liquidação (2.8% a 35x)
         max_sl_pct = 0.020  # Trava o stop em no máximo 2% de oscilação do preço
         if (distancia_sl / price) > max_sl_pct:
             distancia_sl = price * max_sl_pct
@@ -98,15 +95,12 @@ class GerenciadorRiscoAutonomo:
             symbol = signal['symbol']
             if symbol in open_symbols: continue
 
-            # Checa o cooldown individual da moeda
             tempo_liberacao = await self.db.get_cooldown(symbol)
             if time.time() < tempo_liberacao: continue
             if len(open_symbols) >= Config.MAX_OPEN_TRADES: break
 
-            # 🧠 Executa o cálculo autônomo da topologia do trade
             topology = self.calcular_topologia_trade(signal)
 
-            # Monta o pacote de ordem purificado
             order_packet = {
                 'symbol': symbol,
                 'direction': signal['direction'],
@@ -116,7 +110,6 @@ class GerenciadorRiscoAutonomo:
                 'sl': topology['sl']
             }
 
-            # Envia o comando cego de execução para o soldado (executor.py)
             sucesso = await self.executor.order_router_inbound(order_packet, signal)
             
             if sucesso:
@@ -136,8 +129,8 @@ class GerenciadorRiscoAutonomo:
 
     async def gerenciar_defesa_elastica_balde(self):
         """
-        🛡️ CATRACA MÓVEL EM FASES E HARD STOP GLOBAL
-        Monitora todas as posições ativas de forma agregada no balde.
+        🛡️ CATRACA MÓVEL EM FASES (OTIMIZADA) E HARD STOP GLOBAL
+        Monitora posições ativas dando espaço para o trade respirar.
         """
         positions = await self.executor.execution.get_current_positions(self.db)
         now = time.time()
@@ -158,27 +151,25 @@ class GerenciadorRiscoAutonomo:
         current_roe = total_net_pnl / total_margin
         max_roe = self.max_basket_pnl / total_margin
 
-        # 🛑 HARD STOP GLOBAL RELAXADO: Proteção de Cisne Negro (-70% ROE)
-        # Evita canibalizar ou fechar a operação na respiração técnica normal do trade.
+        # 🛑 HARD STOP GLOBAL: Proteção contra Cisne Negro (-70% ROE)
         stop_dinamico_usd = -total_margin * 0.70  
         fase_catraca = "INATIVA"
         
-        # ⚡ SISTEMA DE ASFIXIA NÃO-LINEAR (Catraca Móvel)
-        if max_roe >= 0.50:
-            # Fase 3 (Asfixia Final): Garante no mínimo +35% de ROE puro se o preço recuar.
+        # ⚡ SISTEMA DE ASFIXIA OTIMIZADO (Fases com folga para surf de tendência)
+        if max_roe >= 0.60:
+            # Fase 3 (Asfixia Final): Acima de 60% de ROE, trava recuando 15%
             stop_dinamico_usd = (max_roe - 0.15) * total_margin
             fase_catraca = "ASFIXIA (Fase 3)"
-        elif max_roe >= 0.30:
-            # Fase 2 (Fixação): Garante no mínimo +15% de ROE puro.
+        elif max_roe >= 0.35:
+            # Fase 2 (Fixação): Acima de 35% de ROE, trava garantindo o lucro substancial
             stop_dinamico_usd = (max_roe - 0.15) * total_margin
             fase_catraca = "FIXAÇÃO (Fase 2)"
-        elif max_roe >= 0.15:
-            # Fase 1 (Break-Even): Preço andou a favor, trava em +2% de ROE para pagar as taxas Bybit.
+        elif max_roe >= 0.20:
+            # Fase 1 (Break-Even): Só ativa quando atinge 20% de ROE (evita fechar nos primeiros cêntimos)
             stop_dinamico_usd = 0.02 * total_margin
             fase_catraca = "BREAK-EVEN (Fase 1)"
 
         if total_net_pnl <= stop_dinamico_usd:
-            # Comando de execução forçada: Liquida a cesta inteira imediatamente
             logging.warning(f"🚨 COMANDO DE DEFESA ATIVADO: Fechamento global disparado. Motivo: {fase_catraca if fase_catraca != 'INATIVA' else 'Hard Stop Global'}")
             
             for p in positions:
@@ -206,10 +197,7 @@ class GerenciadorRiscoAutonomo:
         logging.info("🧠 AGENTE AUTÔNOMO DE GESTÃO DE RISCO ONLINE (100% INDEPENDENTE)")
         while True:
             try:
-                # 1. Processa novos sinais gerados pelo analisador.py
                 await self.processar_sinais_inbound()
-                
-                # 2. Gerencia as catracas móveis e o hard stop de toda a carteira ativa
                 await self.gerenciar_defesa_elastica_balde()
             except Exception as e:
                 logging.error(f"Erro no loop do gerenciador autônomo: {e}")
