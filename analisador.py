@@ -1,4 +1,3 @@
-
 import sys
 import os
 import asyncio
@@ -91,16 +90,18 @@ class LiquidityCore:
 
             if ob.get('bids') and ob.get('asks'):
                 mid_price = (ob['bids'][0][0] + ob['asks'][0][0]) / 2.0
-                bid_vol = sum(vol * math.exp(-100 * abs(price - mid_price) / mid_price) for price, vol in ob['bids'][:10])
-                ask_vol = sum(vol * math.exp(-100 * abs(price - mid_price) / mid_price) for price, vol in ob['bids'][:10])
+                # OTIMIZAÇÃO: Relaxamento do peso exponencial para captar mais volume e gerar mais sinais
+                bid_vol = sum(vol * math.exp(-50 * abs(price - mid_price) / mid_price) for price, vol in ob['bids'][:10])
+                ask_vol = sum(vol * math.exp(-50 * abs(price - mid_price) / mid_price) for price, vol in ob['bids'][:10])
                 total = bid_vol + ask_vol
                 if total > 0: vwap_imb = (bid_vol / total) * 100
 
             spoof_buy, spoof_sell = False, False
             prev = self.ob_history[ex_name].get(symbol_spot)
             if prev:
-                if prev['bids'] > 0 and (prev['bids'] - bid_vol) / prev['bids'] > 0.20: spoof_buy = True
-                if prev['asks'] > 0 and (prev['asks'] - ask_vol) / prev['asks'] > 0.20: spoof_sell = True
+                # OTIMIZAÇÃO: Só considera Spoofing se retirarem 35% da liquidez (mercado mais volátil aceito)
+                if prev['bids'] > 0 and (prev['bids'] - bid_vol) / prev['bids'] > 0.35: spoof_buy = True
+                if prev['asks'] > 0 and (prev['asks'] - ask_vol) / prev['asks'] > 0.35: spoof_sell = True
 
             self.ob_history[ex_name][symbol_spot] = {'bids': bid_vol, 'asks': ask_vol}
 
@@ -244,7 +245,6 @@ class RadarCore:
         df['cvd'] = (df['volume'] * df['candle_dir']).cumsum()
         df['cvd_trend'] = df['cvd'] - df['cvd'].rolling(20).mean()
 
-        # Tratamento seguro para sensores não-presentes ao vivo (OI e Funding)
         if 'open_interest' in df.columns:
             df['oi_temp'] = df['open_interest'].replace(0, np.nan).ffill().bfill()
             df['oi_change'] = df['oi_temp'].pct_change(fill_method=None).fillna(0.0)
@@ -259,7 +259,7 @@ class RadarCore:
             df['oi_change'] = 0.0; df['oi_trend'] = 0.0; df['oi_price_divergence'] = 0.0
 
         # ====================================================================================
-        # INJEÇÃO DOS 15 NOVOS SENSORES QUANTITATIVOS AO VIVO (34 Features Totais)
+        # MATRIZ 34 SENSORES INSTITUCIONAIS
         # ====================================================================================
         df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
         df['obv_slope'] = df['obv'].diff(3).fillna(0.0)
@@ -344,7 +344,6 @@ class RadarCore:
         return df
 
     def predict_with_brain(self, brain, current_data_row):
-        # 🛡️ FIX INSTITUCIONAL: A Matriz de 34 Sensores Completa e Perfeita
         features = [
             'RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos', 'ADX_14', 
             'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence', 'cvd_trend', 'oi_change', 
@@ -366,7 +365,7 @@ class RadarCore:
             X_meta = np.column_stack((brain['lgbm'].predict_proba(X_pred), brain['xgb'].predict_proba(X_pred), brain['catboost'].predict_proba(X_pred)))
             final_probs = brain['meta'].predict_proba(X_meta)[0]
 
-            # 🛡️ CORREÇÃO DO BUG BIDIRECIONAL: Indexação Segura (Sem IndexErrors em classe 2)
+            # 🛡️ FIX BIDIRECIONAL
             prob_alta = final_probs[1] * 100 if len(final_probs) > 1 else 0
             prob_queda = final_probs[2] * 100 if len(final_probs) > 2 else 0
 
@@ -419,46 +418,47 @@ class RadarCore:
 
     def calculate_conviction_score(self, direction, ml_prob, vwap_dict, cvd_dict, spoof_buy_dict, spoof_sell_dict, nlp_sentiment, current_atr, raw_price, bb_pos):
         
-        # --- 🛡️ BLOQUEIO RÍGIDO INSTITUCIONAL (ARMADILHA DO ESPAÇO) ---
-        # bb_pos >= 0.95 significa exaustão compradora extrema (Topo).
-        # bb_pos <= 0.05 significa exaustão vendedora extrema (Fundo).
+        # --- 🛡️ BLOQUEIO RÍGIDO INSTITUCIONAL ---
         if direction == 'BUY' and bb_pos >= 0.95:
-            return 0, 1, f"VETO ESPAÇO RIGIDO: Compra de Topo Bloqueada (bb_pos={bb_pos:.2f}). Risco extremo de reversão."
+            return 0, 1, f"VETO ESPAÇO RIGIDO: Compra de Topo Bloqueada (bb_pos={bb_pos:.2f})."
         if direction == 'SELL' and bb_pos <= 0.05:
-            return 0, 1, f"VETO ESPAÇO RIGIDO: Venda de Fundo Bloqueada (bb_pos={bb_pos:.2f}). Risco extremo de repique."
+            return 0, 1, f"VETO ESPAÇO RIGIDO: Venda de Fundo Bloqueada (bb_pos={bb_pos:.2f})."
         
         ml_pts = 0.0
         if ml_prob >= 80.0: ml_pts = 4.0
         elif ml_prob >= 70.0: ml_pts = 3.0
-        elif ml_prob >= 65.0: ml_pts = 2.0
-        elif ml_prob >= 60.0: ml_pts = 1.0
+        elif ml_prob >= 60.0: ml_pts = 2.0
+        elif ml_prob >= 55.0: ml_pts = 1.0 # OTIMIZAÇÃO: Tolerância aumentada
         else: return 0, 1, f"VETO ML: Probabilidade Baixa ({ml_prob:.1f}%)."
         
         expected_move_pct = (current_atr * 2.0 / raw_price) * 100.0
         espaco_pts = 0.0
-        if expected_move_pct >= 2.0: espaco_pts = 3.0
-        elif expected_move_pct >= 1.0: espaco_pts = 2.0
-        elif expected_move_pct >= 0.5: espaco_pts = 1.0
+        if expected_move_pct >= 1.5: espaco_pts = 3.0
+        elif expected_move_pct >= 0.8: espaco_pts = 2.0
+        elif expected_move_pct >= 0.4: espaco_pts = 1.0 # OTIMIZAÇÃO: Alvos mais curtos aceitos
         else: return 0, 1, f"VETO ESPAÇO: Alvo muito curto ({expected_move_pct:.2f}%)."
         
         liq_pts = 0.0
         apoios = []
-        if direction == 'BUY' and vwap_dict.get('Binance', 50) >= 50.5: 
+        
+        # OTIMIZAÇÃO: Limiares do VWAP relaxados de 50.5 para 50.2
+        if direction == 'BUY' and vwap_dict.get('Binance', 50) >= 50.2: 
             liq_pts += 1.0
             apoios.append('Binance_VWAP')
-        elif direction == 'SELL' and vwap_dict.get('Binance', 50) <= 49.5: 
+        elif direction == 'SELL' and vwap_dict.get('Binance', 50) <= 49.8: 
             liq_pts += 1.0
             apoios.append('Binance_VWAP')
 
-        if direction == 'BUY' and vwap_dict.get('Bybit', 50) >= 50.5: 
+        if direction == 'BUY' and vwap_dict.get('Bybit', 50) >= 50.2: 
             liq_pts += 1.0
             apoios.append('Bybit_VWAP')
-        elif direction == 'SELL' and vwap_dict.get('Bybit', 50) <= 49.5: 
+        elif direction == 'SELL' and vwap_dict.get('Bybit', 50) <= 49.8: 
             liq_pts += 1.0
             apoios.append('Bybit_VWAP')
 
-        cvd_buy = cvd_dict.get('Binance', 50.0) >= 50.5 or cvd_dict.get('Bybit', 50.0) >= 50.5
-        cvd_sell = cvd_dict.get('Binance', 50.0) <= 49.5 or cvd_dict.get('Bybit', 50.0) <= 49.5
+        # OTIMIZAÇÃO: Limiares do CVD relaxados para 50.2
+        cvd_buy = cvd_dict.get('Binance', 50.0) >= 50.2 or cvd_dict.get('Bybit', 50.0) >= 50.2
+        cvd_sell = cvd_dict.get('Binance', 50.0) <= 49.8 or cvd_dict.get('Bybit', 50.0) <= 49.8
         if direction == 'BUY' and cvd_buy: 
             liq_pts += 1.0
             apoios.append('CVD')
@@ -476,7 +476,9 @@ class RadarCore:
         total = ml_pts + espaco_pts + liq_pts
         detalhes = ", ".join(apoios) if apoios else "Nenhum"
         motivo_detalhado = f"ML_Dir:{ml_pts:.1f} | ML_Espaço:{espaco_pts:.1f}({expected_move_pct:.1f}%) | Fluxo:{liq_pts:.1f}({detalhes})"
-        return total, (2 if total >= 8.0 else 1), motivo_detalhado
+        
+        # OTIMIZAÇÃO: Corte Final flexibilizado para 7.0
+        return total, (2 if total >= 7.0 else 1), motivo_detalhado
 
     async def scan_market(self):
         ativos = Config.get_ativos()
