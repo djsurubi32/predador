@@ -1,7 +1,6 @@
 import sys
 import os
 import asyncio
-import math
 import logging
 import time
 import sqlite3
@@ -31,7 +30,6 @@ class TelegramLogger:
             url = f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/sendMessage"
             payload = {"chat_id": Config.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
             response = requests.post(url, json=payload, timeout=5)
-
             if response.status_code != 200:
                 logging.error(f"❌ Falha no envio do Telegram (Status {response.status_code}): {response.text}")
         except Exception as e:
@@ -182,7 +180,6 @@ class BybitExecutionEngine:
                 price_str = self.private_exchange.price_to_precision(symbol, limit_price)
 
                 order = await asyncio.to_thread(self.private_exchange.create_order, symbol, 'limit', order_side, float(amount_str), float(price_str), {'reduceOnly': True, 'postOnly': True})
-                
                 await asyncio.sleep(0.5)
 
                 fetched_order = await asyncio.to_thread(self.private_exchange.fetch_order, order['id'], symbol, params={'acknowledged': True})
@@ -210,10 +207,8 @@ class BybitExecutionEngine:
             price_str = self.private_exchange.price_to_precision(symbol, limit_price)
             
             params = {}
-            if sl_price is not None:
-                params['stopLoss'] = str(sl_price)
-            if tp_price is not None:
-                params['takeProfit'] = str(tp_price)
+            if sl_price is not None: params['stopLoss'] = str(sl_price)
+            if tp_price is not None: params['takeProfit'] = str(tp_price)
 
             order = await asyncio.to_thread(self.private_exchange.create_order, symbol, 'limit', order_side, float(amount_str), float(price_str), params)
             return order
@@ -343,526 +338,35 @@ class EngineExecutor:
 
         self.execution = BybitExecutionEngine(private_exchange=self.private_exchange, public_exchange=self.public_exchange, is_real_mode=Config.OPERA_CONTA_REAL)
         self.db = Database()
-        
         self.oraculo = OraculoBinance()
-
-        self.max_basket_pnl = 0.0
-        self.min_basket_pnl = 0.0
-        self.last_empty_heartbeat = time.time()
-        self.last_summary_time = time.time()
         self.simulated_banca = float(Config.BANCA_DEMO_INICIAL)
 
-    def route_and_calculate_strategy(self, opp):
-        score = float(opp['score'])
-        prob = float(opp['prob'])
+    async def force_close_position(self, symbol: str, side: str, amount: float, outcome: str, pnl: float):
+        """Interface direta de zeragem comandada pelo gerenciador."""
+        await self.execution.close_position_limit_chase(symbol, side, amount)
+        await self.db.remove_trade(symbol)
+        if not Config.OPERA_CONTA_REAL: self.simulated_banca += pnl
+        await self.db.add_history(symbol, side, pnl, outcome)
 
-        reasoning_clean = opp['reasoning'].replace(" ", "")
-        is_fluxo_maximo = "Fluxo:3.0" in reasoning_clean
-        is_espaco_expandido = "ML_Espaço:3.0" in reasoning_clean
+    async def order_router_inbound(self, order_packet: dict, signal_packet: dict):
+        """Roteador cego: Apenas recebe ordens calculadas e as envia à Bybit."""
+        symbol = order_packet['symbol']
+        direction = order_packet['direction']
+        qty = order_packet['qty']
+        current_price = order_packet['current_price']
+        tp_price = order_packet['tp']
+        sl_price = order_packet['sl']
 
-        if score >= 9.0 and prob >= 75.0:
-            return {
-                "vertente": "QUALIDADE EXTREMA (SNIPER)",
-                "lote_tipo": "Lote Sniper",
-                "invest_amount": 6.0,
-                "tp_factor": 1.025,  
-                "sl_factor": 0.990   
-            }
-        elif is_fluxo_maximo:
-            return {
-                "vertente": "SCALPING DE MOMENTUM",
-                "lote_tipo": "Lote Padrão",
-                "invest_amount": 4.0,
-                "tp_factor": 1.015,  
-                "sl_factor": 0.992   
-            }
-        elif is_espaco_expandido:
-            return {
-                "vertente": "DAY TRADE DE EXPANSÃO",
-                "lote_tipo": "Lote Leve",
-                "invest_amount": 3.0,
-                "tp_factor": 1.020,  
-                "sl_factor": 0.988   
-            }
-
-        return {
-            "vertente": "PADRÃO ADAPTATIVO",
-            "lote_tipo": "Lote de Teste",
-            "invest_amount": 2.0,
-            "tp_factor": 1.012,  
-            "sl_factor": 0.993   
-        }
-
-    # As funções macro foram mantidas aqui para que o código não quebre,
-    # mas o seu uso na execução foi desligado mais abaixo.
-    async def check_btc_trend_1h(self) -> str:
         try:
-            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, 'BTC/USDT:USDT', '1h', limit=20)
-            if not candles or len(candles) < 20:
-                return "NEUTRAL"
-            closes = [float(c[4]) for c in candles]
-            sma = sum(closes) / len(closes)
-            current_price = closes[-1]
-            if current_price > sma: return "BULLISH"
-            elif current_price < sma: return "BEARISH"
-            return "NEUTRAL"
-        except Exception as e:
-            return "NEUTRAL"
+            if Config.OPERA_CONTA_REAL:
+                ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
+                limit_price = float(ticker['bid']) if direction == 'BUY' else float(ticker['ask'])
+                order = await self.execution.open_position_limit(symbol, direction, qty, limit_price, sl_price, tp_price)
+                if not order: return False
 
-    async def check_asset_trend_4h(self, symbol: str) -> str:
-        try:
-            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '4h', limit=20)
-            if not candles or len(candles) < 20:
-                return "NEUTRAL"
-            closes = [float(c[4]) for c in candles]
-            sma = sum(closes) / len(closes)
-            current_price = closes[-1]
-            if current_price > sma: return "BULLISH"
-            elif current_price < sma: return "BEARISH"
-            return "NEUTRAL"
-        except Exception as e:
-            return "NEUTRAL"
-
-    async def check_asset_trend_1h(self, symbol: str) -> str:
-        try:
-            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '1h', limit=20)
-            if not candles or len(candles) < 20:
-                return "NEUTRAL"
-            closes = [float(c[4]) for c in candles]
-            sma = sum(closes) / len(closes)
-            current_price = closes[-1]
-            if current_price > sma: return "BULLISH"
-            elif current_price < sma: return "BEARISH"
-            return "NEUTRAL"
-        except Exception as e:
-            return "NEUTRAL"
-
-    async def check_open_interest_healthy(self, symbol: str) -> bool:
-        try:
-            oi_data = await asyncio.to_thread(self.public_exchange.fetch_open_interest, symbol)
-            if oi_data and len(oi_data) > 0:
-                oi_value = float(oi_data[0].get('openInterestAmount', 0) or 0)
-                return oi_value > 0
+            await self.db.add_trade(symbol, direction, current_price, sl_price, tp_price, qty, 1)
+            await self.db.set_cooldown(symbol, time.time() + (60 * 60))
             return True
-        except Exception:
-            return True
-
-    async def analisar_imbalance_l2_bybit(self, symbol: str) -> float:
-        try:
-            ob = await asyncio.to_thread(self.public_exchange.fetch_order_book, symbol, limit=50)
-            bids = np.array(ob['bids'])
-            asks = np.array(ob['asks'])
-
-            vol_bids = np.sum(bids[:, 0] * bids[:, 1]) if len(bids) > 0 else 0.0
-            vol_asks = np.sum(asks[:, 0] * asks[:, 1]) if len(asks) > 0 else 0.0
-
-            imbalance = (vol_bids - vol_asks) / (vol_bids + vol_asks + 1e-9)
-            return float(imbalance)
         except Exception as e:
-            return 0.0
-
-    async def analisar_delta_volume_bybit(self, symbol: str) -> float:
-        try:
-            ohlcv = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '1m', limit=15)
-            if not ohlcv or len(ohlcv) < 5:
-                return 0.0
-            
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['dir'] = np.where(df['close'] > df['open'], 1, np.where(df['close'] < df['open'], -1, 0))
-            df['vol_agressao'] = df['volume'] * df['dir']
-            
-            delta_total = df['vol_agressao'].sum()
-            volume_total = df['volume'].sum()
-
-            cvd_ratio = delta_total / (volume_total + 1e-9)
-            return float(cvd_ratio)
-        except Exception as e:
-            return 0.0
-
-    async def validar_microestrutura_bybit(self, symbol: str, direction: str) -> tuple[bool, str]:
-        try:
-            tarefa_l2 = self.analisar_imbalance_l2_bybit(symbol)
-            tarefa_cvd = self.analisar_delta_volume_bybit(symbol)
-            
-            imbalance_l2, cvd_ratio = await asyncio.gather(tarefa_l2, tarefa_cvd)
-
-            aprovado = False
-            motivo = ""
-
-            if direction == 'BUY':
-                if imbalance_l2 >= -0.05 and cvd_ratio >= -0.05:
-                    aprovado = True
-                    motivo = f"L2: {imbalance_l2:.2f} | CVD: {cvd_ratio:.2f}"
-                else:
-                    motivo = f"Bloqueio Local (Muralha: {imbalance_l2:.2f} / Despejo: {cvd_ratio:.2f})"
-            elif direction == 'SELL':
-                if imbalance_l2 <= 0.05 and cvd_ratio <= 0.05:
-                    aprovado = True
-                    motivo = f"L2: {imbalance_l2:.2f} | CVD: {cvd_ratio:.2f}"
-                else:
-                    motivo = f"Bloqueio Local (Muralha: {imbalance_l2:.2f} / Absorção: {cvd_ratio:.2f})"
-
-            return aprovado, motivo
-        except Exception as e:
-            return True, "Bybit Local Indisponível - Bypass Automático"
-
-    async def reconcile_positions(self):
-        if not Config.OPERA_CONTA_REAL: return
-        try:
-            real_positions = await self.execution.get_current_positions()
-            real_symbols = {p['symbol'] for p in real_positions}
-            open_trades = await self.db.get_all_open_trades()
-
-            for trade in open_trades:
-                symbol = trade[0]
-                open_time = trade[4]
-                if symbol not in real_symbols:
-                    if time.time() - open_time < 30.0: continue
-                    if self.private_exchange:
-                        orders = await asyncio.to_thread(self.private_exchange.fetch_open_orders, symbol)
-                        if len(orders) == 0:
-                            await self.db.remove_trade(symbol)
-                    else:
-                        await self.db.remove_trade(symbol)
-        except Exception:
-            pass
-
-    async def cancel_old_pending_orders(self):
-        if not Config.OPERA_CONTA_REAL or not self.private_exchange: return
-        try:
-            open_trades = await self.db.get_all_open_trades()
-            for trade in open_trades:
-                symbol = trade[0]
-                try:
-                    orders = await asyncio.to_thread(self.private_exchange.fetch_open_orders, symbol)
-                    now = time.time()
-                    for order in orders:
-                        order_time = order['timestamp'] / 1000.0
-                        if now - order_time >= (Config.MAX_PENDING_ORDER_MINUTES * 60):
-                            await asyncio.to_thread(self.private_exchange.cancel_order, order['id'], symbol)
-                except Exception:
-                    pass
-                await asyncio.sleep(0.1)
-        except Exception:
-            pass
-
-    async def monitor_individual_positions(self):
-        try:
-            positions = await self.execution.get_current_positions(self.db)
-            if not positions:
-                return
-
-            open_trades = await self.db.get_all_open_trades()
-            trade_dict = {t[0]: t for t in open_trades}
-
-            symbols_to_fetch = [p['symbol'] for p in positions if p['symbol'] in trade_dict]
-            if not symbols_to_fetch: return
-            
-            tickers = await asyncio.to_thread(self.public_exchange.fetch_tickers, symbols_to_fetch)
-
-            for p in positions:
-                symbol = p['symbol']
-                if symbol not in trade_dict:
-                    continue
-
-                trade = trade_dict[symbol]
-                side = trade[1].upper()
-                sl_price = float(trade[5])
-                tp_price = float(trade[6])
-                
-                ticker = tickers.get(symbol, {})
-                current_price = float(ticker.get('last') or ticker.get('close') or 0.0)
-                
-                if current_price == 0.0: continue
-
-                fechar = False
-                motivo = ""
-
-                if side in ['LONG', 'BUY']:
-                    if current_price >= tp_price:
-                        fechar = True
-                        motivo = "🎯 TAKE PROFIT INDIVIDUAL ATINGIDO"
-                    elif current_price <= sl_price:
-                        fechar = True
-                        motivo = "🛑 STOP LOSS INDIVIDUAL ATINGIDO"
-                else:
-                    if current_price <= tp_price:
-                        fechar = True
-                        motivo = "🎯 TAKE PROFIT INDIVIDUAL ATINGIDO"
-                    elif current_price >= sl_price:
-                        fechar = True
-                        motivo = "🛑 STOP LOSS INDIVIDUAL ATINGIDO"
-
-                if fechar:
-                    amount = float(p.get('contracts', 0))
-                    if amount > 0:
-                        logging.info(f"Fechando moeda isolada {symbol} ({side}) - {motivo}")
-                        await self.execution.close_position_market(symbol, side, amount)
-                    
-                    pnl_realizado = float(p.get('netPnl', 0))
-                    await self.db.remove_trade(symbol)
-                    
-                    if not Config.OPERA_CONTA_REAL:
-                        self.simulated_banca += pnl_realizado
-                    
-                    await self.db.add_history(symbol, side, pnl_realizado, motivo)
-
-                    banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
-                    msg = (
-                        f"{motivo} [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
-                        f"Ativo: {symbol}\n"
-                        f"Direção: {side}\n"
-                        f"PnL Líquido: ${pnl_realizado:.2f}\n"
-                        f"Saldo Atual: ${banca_atual:.2f}"
-                    )
-                    await TelegramLogger.send(msg)
-                    logging.info(msg.replace("\n", " - "))
-        except Exception as e:
-            pass
-
-    async def manage_basket(self):
-        positions = await self.execution.get_current_positions(self.db)
-        now = time.time()
-
-        if not positions:
-            self.max_basket_pnl = 0.0
-            self.min_basket_pnl = 0.0
-            self.last_summary_time = now
-            if now - self.last_empty_heartbeat > 60:
-                logging.info("⚖️ Balde vazio. Aguardando oportunidades das vertentes...")
-                self.last_empty_heartbeat = now
-            return
-
-        total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
-        total_margin = sum((float(p.get('contracts', 0)) * float(p.get('entryPrice', 0))) / Config.ALAVANCAGEM for p in positions)
-
-        if total_margin <= 0: return
-
-        if total_net_pnl > self.max_basket_pnl:
-            self.max_basket_pnl = total_net_pnl
-        if total_net_pnl < self.min_basket_pnl:
-            self.min_basket_pnl = total_net_pnl
-
-        current_roe = total_net_pnl / total_margin
-        max_roe = self.max_basket_pnl / total_margin
-
-        stop_dinamico_usd = -total_margin * 0.40  
-        fase_catraca = "INATIVA"
-        
-        if max_roe >= 0.50:
-            stop_dinamico_usd = (max_roe - 0.15) * total_margin
-            fase_catraca = "ASFIXIA (Fase 3)"
-        elif max_roe >= 0.30:
-            stop_dinamico_usd = (max_roe - 0.15) * total_margin
-            fase_catraca = "FIXAÇÃO (Fase 2)"
-        elif max_roe >= 0.15:
-            stop_dinamico_usd = 0.02 * total_margin
-            fase_catraca = "BREAK-EVEN (Fase 1)"
-
-        acao = None
-        motivo = ""
-        lucro_final = total_net_pnl
-
-        if total_net_pnl <= stop_dinamico_usd:
-            acao = "FECHAR_TUDO"
-            if fase_catraca != "INATIVA":
-                motivo = (
-                    f"🔵 CATRACA MÓVEL ACIONADA [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
-                    f"Fase Ativa: {fase_catraca}\n"
-                    f"Proteção elástica executada com precisão no ROE.\n"
-                    f"Resultado líquido: ${lucro_final:.2f}"
-                )
-            else:
-                motivo = (
-                    f"🛑 STOP LOSS DO BALDE ACIONADO [{ 'CONTA REAL' if Config.OPERA_CONTA_REAL else 'SIMULAÇÃO' }]\n"
-                    f"Cortando perdas agregadas (Hard Stop de Proteção).\n"
-                    f"Resultado líquido: ${lucro_final:.2f}"
-                )
-
-        if acao == "FECHAR_TUDO":
-            if not Config.OPERA_CONTA_REAL:
-                self.simulated_banca += lucro_final
-
-            banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
-            msg = f"{motivo}\nSaldo da banca: ${banca_atual:.2f}"
-            await TelegramLogger.send(msg)
-            logging.info(msg.replace("\n", " - "))
-
-            for p in positions:
-                symbol = p['symbol']
-                side = p['side']
-                amount = float(p.get('contracts', 0))
-                if amount > 0:
-                    logging.info(f"Fechando {symbol} ({side}) - Catraca Global")
-                    await self.execution.close_position_limit_chase(symbol, side, amount)
-
-                await self.db.remove_trade(symbol)
-                await self.db.add_history(symbol, side, lucro_final / len(positions), 'BASKET_CLOSE')
-
-            self.max_basket_pnl = 0.0
-            self.min_basket_pnl = 0.0
-
-        elif acao is None and (now - self.last_summary_time >= 600):
-            self.last_summary_time = now
-            modo_texto = "CONTA REAL" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO"
-            
-            resumo_msg = (
-                f"⏱️ <b>RAIO-X DO BALDE (10 min)</b> [{modo_texto}]\n\n"
-                f"🔹 <b>Operações:</b> {len(positions)}/{Config.MAX_OPEN_TRADES}\n"
-                f"🔹 <b>Margem Alocada:</b> ${total_margin:.2f}\n"
-                f"🔹 <b>PnL Atual:</b> ${total_net_pnl:.2f} ({current_roe * 100:.1f}% ROE)\n\n"
-                f"📈 <b>Topo (Max PnL):</b> ${self.max_basket_pnl:.2f} ({max_roe * 100:.1f}% ROE)\n"
-                f"📉 <b>Fundo (Min PnL):</b> ${self.min_basket_pnl:.2f}\n\n"
-                f"🔒 <b>Catraca:</b> {fase_catraca}\n"
-                f"🛑 <b>Gatilho de Fechamento em:</b> ${stop_dinamico_usd:.2f}"
-            )
-            await TelegramLogger.send(resumo_msg)
-
-    async def execute_signals(self):
-        signals = await self.db.get_elite_signals()
-        if not signals: return
-
-        open_trades = await self.db.get_all_open_trades()
-        open_symbols = {t[0] for t in open_trades}
-
-        if len(open_symbols) >= Config.MAX_OPEN_TRADES: return
-
-        positions = await self.execution.get_current_positions(self.db)
-        now = time.time()
-
-        buy_positions_count = sum(1 for p in positions if p['side'] in ['LONG', 'BUY'])
-        sell_positions_count = sum(1 for p in positions if p['side'] in ['SHORT', 'SELL'])
-
-        for signal in signals:
-            symbol = signal['symbol']
-
-            if symbol in open_symbols: continue
-
-            tempo_liberacao = await self.db.get_cooldown(symbol)
-            if now < tempo_liberacao: continue
-
-            if len(open_symbols) >= Config.MAX_OPEN_TRADES: break
-
-            direction = signal['direction']
-
-            if direction == 'BUY' and buy_positions_count >= 3:
-                logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Compra de {symbol} bloqueada. Limite direcional atingido.")
-                continue
-            if direction == 'SELL' and sell_positions_count >= 3:
-                logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Venda de {symbol} bloqueada. Limite direcional atingido.")
-                continue
-
-            # =========================================================================
-            # OTIMIZAÇÃO INSTITUCIONAL: FILTROS MACRO DESLIGADOS
-            # O robô agora opera focado na volatilidade extrema do momento (High-Frequency).
-            # A responsabilidade direcional é 100% do Machine Learning e do Oráculo Binance.
-            # =========================================================================
-
-            oi_healthy = await self.check_open_interest_healthy(symbol)
-            if not oi_healthy:
-                logging.info(f"🚫 [FILTRO OI] Ordem em {symbol} abortada. Sem volume Open Interest.")
-                continue
-
-            oraculo_aprovado, oraculo_motivo = await self.oraculo.validar_sinal_institucional(symbol, direction)
-            if not oraculo_aprovado:
-                logging.info(f"🚫 [ORÁCULO BINANCE] Ordem em {symbol} ({direction}) bloqueada pela Binance. Motivo: {oraculo_motivo}")
-                continue
-
-            bybit_aprovado, bybit_motivo = await self.validar_microestrutura_bybit(symbol, direction)
-            if not bybit_aprovado:
-                logging.info(f"🚫 [BATEDOR BYBIT] Ordem em {symbol} ({direction}) bloqueada localmente. Motivo: {bybit_motivo}")
-                continue
-
-            strategy = self.route_and_calculate_strategy(signal)
-            amount_to_invest = strategy["invest_amount"]
-
-            ticker = await asyncio.to_thread(self.public_exchange.fetch_ticker, symbol)
-            current_price = float(ticker.get('last') or ticker.get('close') or signal['price'])
-
-            if current_price <= 0: continue
-
-            qty = (amount_to_invest * Config.ALAVANCAGEM) / current_price
-
-            if direction == 'BUY':
-                tp_price = current_price * strategy["tp_factor"]
-                sl_price = current_price * strategy["sl_factor"]
-            else:
-                dist_tp = strategy["tp_factor"] - 1.0
-                dist_sl = 1.0 - strategy["sl_factor"]
-                tp_price = current_price * (1.0 - dist_tp)
-                sl_price = current_price * (1.0 + dist_sl)
-
-            try:
-                if Config.OPERA_CONTA_REAL:
-                    limit_price = float(ticker['bid']) if direction == 'BUY' else float(ticker['ask'])
-                    order = await self.execution.open_position_limit(symbol, direction, qty, limit_price, sl_price, tp_price)
-                    if not order: continue
-
-                await self.db.add_trade(symbol, direction, current_price, sl_price, tp_price, qty, 1)
-                open_symbols.add(symbol)
-                
-                if direction == 'BUY':
-                    buy_positions_count += 1
-                else:
-                    sell_positions_count += 1
-
-                banca_atual = await self.execution.get_equity() if Config.OPERA_CONTA_REAL else self.simulated_banca
-
-                modo_texto = "CONTA REAL" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO"
-                msg = (
-                    f"🔬 [{modo_texto}] ORDEM DETECTADA | {strategy['vertente']}\n\n"
-                    f"Ativo: {symbol} | Direção: {direction}\n"
-                    f"Valor alocado: ${amount_to_invest:.2f} ({strategy['lote_tipo']})\n"
-                    f"Score: {signal['score']:.1f}/10.0 | Probabilidade: {signal['prob']:.1f}%\n"
-                    f"Ml: {signal['reasoning']}\n"
-                    f"Oráculo Binance: {oraculo_motivo}\n"
-                    f"Batedor Bybit: Validado Local ({bybit_motivo})\n"
-                    f"Saldo da banca: ${banca_atual:.2f}"
-                )
-
-                await TelegramLogger.send(msg)
-                logging.info(f"Ordem aberta ({modo_texto}): {symbol} {direction} - Tipo: {strategy['lote_tipo']} - Preço: {current_price}")
-
-                await self.db.set_cooldown(symbol, now + (60 * 60))
-
-            except Exception as e:
-                logging.error(f"Erro ao executar sinal {symbol}: {e}")
-
-    async def start_execution_loop(self):
-        logging.info("🚀 PREDADOR QUANTITATIVO ONLINE")
-
-        if not Config.OPERA_CONTA_REAL:
-            logging.info("🧹 Modo SIMULAÇÃO detectado. Executando limpeza de operações fantasmas e histórico do banco de dados...")
-            await self.db.clear_simulation_state()
-
-        await asyncio.to_thread(self.execution.init_markets_sync)
-
-        modo = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO/DEMO 🔬"
-        msg_inicio = (
-            f"🚀 PREDADOR QUANTITATIVO ONLINE\n"
-            f"O motor executor bidirecional foi iniciado com sucesso!\n"
-            f"Modo Operacional: {modo}\n"
-            f"Alavancagem Fixa: {Config.ALAVANCAGEM}x\n"
-            f"Limite do Balde: {Config.MAX_OPEN_TRADES} trades simultâneos.\n"
-            f"Saldo Inicial: ${Config.BANCA_DEMO_INICIAL:.2f}"
-        )
-        await TelegramLogger.send(msg_inicio)
-
-        while True:
-            try:
-                await self.reconcile_positions()
-                await self.cancel_old_pending_orders()
-                await self.execute_signals()
-                await self.monitor_individual_positions()
-                await self.manage_basket()
-            except Exception as e:
-                logging.error(f"Erro no loop principal do executor: {e}")
-            finally:
-                await asyncio.sleep(1)
-
-if __name__ == "__main__":
-    try:
-        executor = EngineExecutor()
-        asyncio.run(executor.start_execution_loop())
-    except KeyboardInterrupt:
-        logging.info("🛑 Executor encerrado pelo usuário.")
+            logging.error(f"Falha de roteamento crítico em {symbol}: {e}")
+            return False

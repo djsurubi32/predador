@@ -1,74 +1,96 @@
+import multiprocessing
+import asyncio
+import logging
 import sys
 import time
-import logging
-import asyncio
-import threading
 
-from config import Config
-from treinador import MotorTreinamento
-from analisador import RadarCore  # CORREÇÃO: Nome e importação corretos
-from executor import EngineExecutor
-from keep_alive import keep_alive # CORREÇÃO: Utilizando o seu módulo modularizado
+# Importação dos nossos microserviços isolados
+from treinador import main as treinador_main
+from analisador import RadarCore
+from gerenciador import GerenciadorRiscoAutonomo
 
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s', 
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# Configuração do Orquestrador
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [MAESTRO] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-def run_treinador_loop():
-    """Thread Síncrona: Treina os modelos de IA e hiberna."""
-    treinador = MotorTreinamento()
-    while True:
-        try:
-            treinador.iniciar_ciclo_treinamento()
-            time.sleep(Config.HORAS_RETREINO * 3600)
-        except Exception as e:
-            logging.error(f"Erro Crítico no Loop do Treinador: {e}")
-            time.sleep(60)
-
-def run_radar_loop():
-    """Thread Assíncrona: Varre o mercado 24/7 alimentando o banco de dados (Sinais)."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # O RadarCore agora usa o seu próprio pool otimizado de conexões HTTP (Sem injeção externa)
-    radar = RadarCore() 
+def run_treinador():
+    """Microserviço 1: Forja de Inteligência Artificial (Heavy CPU)"""
+    logging.info("🧠 Iniciando microserviço: TREINADOR (Machine Learning)")
     try:
-        # CORREÇÃO: Chamando o método real do analisador
-        loop.run_until_complete(radar.scan_market()) 
-    except Exception as e:
-        logging.error(f"Erro Crítico no Loop do Radar: {e}")
-
-def main():
-    logging.info("🛡️ Iniciando ecossistema Predador 2.0...")
-    
-    # 1. Ativa o Escudo Anti-Crash (Healthcheck da VPS)
-    keep_alive()
-
-    # 2. Inicia o Cérebro Institucional (Treinador de IA)
-    logging.info("🧠 Ligando Motor de Machine Learning (Treinador)...")
-    threading.Thread(target=run_treinador_loop, daemon=True, name="Treinador").start()
-
-    # Breve pausa para garantir que o modelo inicie a alocação de memória com segurança
-    time.sleep(5)
-
-    # 3. Inicia o Motor de Varredura (Radar)
-    logging.info("📡 Ligando Motor de Varredura Quantitativa (Radar)...")
-    threading.Thread(target=run_radar_loop, daemon=True, name="Radar").start()
-
-    time.sleep(3)
-
-    # 4. Inicia o Motor de Execução Institucional (Na Main Thread)
-    logging.info("⚡ Ligando Motor de Execução e Catraca Elástica...")
-    executor = EngineExecutor()
-    try:
-        asyncio.run(executor.start_execution_loop())
+        treinador_main()
     except KeyboardInterrupt:
-        logging.info("🛑 Sistema Predador encerrado pelo usuário.")
+        pass
+    except Exception as e:
+        logging.error(f"❌ Falha fatal no Treinador: {e}")
 
-if __name__ == '__main__':
-    # Otimização assíncrona mandatória para ambientes Windows
+def run_analisador():
+    """Microserviço 2: Radar de Mercado (Heavy I/O)"""
+    logging.info("📡 Iniciando microserviço: ANALISADOR (Radar Quantitativo)")
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    main()
+    try:
+        radar = RadarCore()
+        asyncio.run(radar.scan_market())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logging.error(f"❌ Falha fatal no Analisador: {e}")
+
+def run_gerenciador():
+    """Microserviço 3: Cérebro de Risco e Execução (Latência Zero)"""
+    logging.info("🛡️ Iniciando microserviço: GERENCIADOR (Agente Autônomo e Catraca)")
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        # O Gerenciador já importa e instancia o executor.py internamente
+        gerenciador = GerenciadorRiscoAutonomo()
+        asyncio.run(gerenciador.loop_agente_autonomo())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logging.error(f"❌ Falha fatal no Gerenciador: {e}")
+
+if __name__ == '__main__':
+    logging.info("===============================================================")
+    logging.info("🚀 SISTEMA PREDADOR QUANTITATIVO V2.0 (ARQUITETURA DISTRIBUÍDA)")
+    logging.info("===============================================================")
+    
+    # Criação dos processos independentes (Isolamento de Memória e CPU)
+    p_treinador = multiprocessing.Process(target=run_treinador, name="Processo-Treinador")
+    p_analisador = multiprocessing.Process(target=run_analisador, name="Processo-Analisador")
+    p_gerenciador = multiprocessing.Process(target=run_gerenciador, name="Processo-Gerenciador")
+
+    # Ordem de ignição faseada (para não saturar a rede SQLite e as APIs no mesmo milissegundo)
+    p_treinador.start()
+    time.sleep(3)  # Dá 3 segundos para a IA aquecer
+    
+    p_analisador.start()
+    time.sleep(3)  # Dá 3 segundos para o Radar estabilizar as conexões WebSocket/REST
+    
+    p_gerenciador.start()
+
+    try:
+        # O Maestro fica num loop suave apenas a monitorizar a saúde dos seus 3 filhos
+        while True:
+            if not p_treinador.is_alive():
+                logging.warning("⚠️ Alerta: O processo TREINADOR parou inesperadamente.")
+            if not p_analisador.is_alive():
+                logging.warning("⚠️ Alerta: O processo ANALISADOR parou inesperadamente.")
+            if not p_gerenciador.is_alive():
+                logging.warning("⚠️ Alerta: O processo GERENCIADOR parou inesperadamente.")
+            
+            # Hiberna por 60 segundos antes de fazer novo check-up
+            time.sleep(60)
+            
+    except KeyboardInterrupt:
+        # Morte Limpa (Graceful Shutdown) caso prima Ctrl+C no terminal
+        logging.info("🛑 Comando de paragem recebido. A desligar todos os motores de forma segura...")
+        p_treinador.terminate()
+        p_analisador.terminate()
+        p_gerenciador.terminate()
+        
+        p_treinador.join()
+        p_analisador.join()
+        p_gerenciador.join()
+        
+        logging.info("✅ Sistema integralmente encerrado.")
+        sys.exit(0)
