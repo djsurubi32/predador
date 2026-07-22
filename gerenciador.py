@@ -20,6 +20,7 @@ class GerenciadorRiscoAutonomo:
         self.db = self.executor.db
         self.max_basket_pnl = 0.0
         self.min_basket_pnl = 0.0
+        self.last_summary_time = time.time()  # ⏱️ Controle de tempo para o relatório de 10 minutos
 
     def calcular_topologia_trade_avancada(self, signal: dict) -> dict:
         """
@@ -38,22 +39,19 @@ class GerenciadorRiscoAutonomo:
         conviction = (score_norm * 0.6) + (prob_norm * 0.4)
 
         # 2. Alavancagem Contínua Dinâmica (1x a 100x)
-        # Em alta convicção e baixa volatilidade, escala exponencialmente até 100x
         atr_pct = (current_atr / price) * 100 if price > 0 else 1.0
         fator_volatilidade = np.clip(1.0 / (atr_pct + 0.1), 0.2, 2.0)
         
-        # Fórmula de Alavancagem Contínua Mapeada
         leverage_raw = 1.0 + (conviction ** 2) * 99.0 * fator_volatilidade
         leverage = int(np.clip(round(leverage_raw), 1, 100))
 
         # 3. Lote/Margem em USD Contínuo ($0.001 a $10.00)
-        # Escala de acordo com a convicção pura do modelo
         min_usd = 0.001
         max_usd = 10.00
         invest_amount = min_usd + (conviction ** 1.5) * (max_usd - min_usd)
         invest_amount = float(np.clip(invest_amount, min_usd, max_usd))
 
-        # 4. Vertente de Classificação para logs e relatórios
+        # 4. Vertente de Classificação
         if conviction >= 0.85:
             vertente = "CONVIÇÃO INSTITUCIONAL EXTREMA (SNIPER)"
             atr_multi_tp = 2.5
@@ -67,11 +65,11 @@ class GerenciadorRiscoAutonomo:
             atr_multi_tp = 1.5
             atr_multi_sl = 1.2
 
-        # 5. Cálculo Matemático Estrito de Alvos baseados no ATR
+        # 5. Cálculo Matemático de Alvos baseados no ATR
         distancia_tp = current_atr * atr_multi_tp
         distancia_sl = current_atr * atr_multi_sl
 
-        max_sl_pct = 0.025  # Trava o stop técnico em até 2.5% do preço
+        max_sl_pct = 0.025  
         if (distancia_sl / price) > max_sl_pct:
             distancia_sl = price * max_sl_pct
 
@@ -95,7 +93,7 @@ class GerenciadorRiscoAutonomo:
         }
 
     async def processar_sinais_inbound(self):
-        """Avalia os sinais e dispara ordens com topologia de risco totalmente livre."""
+        """Avalia os sinais e dispara ordens com topologia de risco livre."""
         signals = await self.db.get_elite_signals()
         if not signals: return
 
@@ -141,8 +139,8 @@ class GerenciadorRiscoAutonomo:
 
     async def gerenciar_defesa_elastica_balde(self):
         """
-        🛡️ CATRACA MÓVEL COM RASTREABILIDADE FINANCEIRA COMPLETA
-        Monitora posições, calcula saldos de banca e acumulados em tempo real.
+        🛡️ CATRACA MÓVEL & RELATÓRIO PERIÓDICO DE 10 MINUTOS
+        Monitora posições ativas, gerencia hard stops e envia estatísticas para o Telegram.
         """
         positions = await self.executor.execution.get_current_positions(self.db)
         now = time.time()
@@ -150,6 +148,7 @@ class GerenciadorRiscoAutonomo:
         if not positions:
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
+            self.last_summary_time = now
             return
 
         total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
@@ -178,6 +177,28 @@ class GerenciadorRiscoAutonomo:
             stop_dinamico_usd = 0.02 * total_margin
             fase_catraca = "BREAK-EVEN (Fase 1)"
 
+        # ⏱️ RELATÓRIO PERIÓDICO DE 10 MINUTOS (Raio-X do Balde para o Telegram)
+        if now - self.last_summary_time >= 600:
+            self.last_summary_time = now
+            modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
+            banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
+            saldo_atual = banca_inicial + total_net_pnl
+
+            resumo_msg = (
+                f"⏱️ <b>RAIO-X DO BALDE (10 min)</b> [{modo_texto}]\n\n"
+                f"🔹 <b>Operações Ativas:</b> {len(positions)}/{Config.MAX_OPEN_TRADES}\n"
+                f"🔹 <b>Margem Alocada:</b> ${total_margin:.2f}\n"
+                f"🔹 <b>PnL Atual Flutuante:</b> ${total_net_pnl:+.2f} ({current_roe * 100:.1f}% ROE)\n\n"
+                f"📈 <b>Topo (Max PnL):</b> ${self.max_basket_pnl:.2f} ({max_roe * 100:.1f}% ROE)\n"
+                f"📉 <b>Fundo (Min PnL):</b> ${self.min_basket_pnl:.2f}\n\n"
+                f"🔒 <b>Catraca Ativa:</b> {fase_catraca}\n"
+                f"💰 <b>Saldo Estimado da Banca:</b> ${saldo_atual:.2f}\n"
+                f"🛑 <b>Gatilho de Fechamento em:</b> ${stop_dinamico_usd:.2f}"
+            )
+            await TelegramLogger.send(resumo_msg)
+            logging.info("⏱️ Relatório de Raio-X do Balde enviado com sucesso para o Telegram.")
+
+        # Disparo da Defesa Global se o PnL atingir o stop dinâmico
         if total_net_pnl <= stop_dinamico_usd:
             logging.warning(f"🚨 DEFESA GLOBAL ACIONADA: Fechamento preventivo via {fase_catraca}")
             
@@ -190,9 +211,7 @@ class GerenciadorRiscoAutonomo:
                     pnl=total_net_pnl / len(positions)
                 )
 
-            # 💰 RECUPERAÇÃO DE DADOS DE BANCA ATUALIZADOS DA CORRETORA/DB
             banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
-            # Lê o acumulado geral do banco ou histórico se houver, simulando com o PnL atual fechado
             saldo_atual_banca = banca_inicial + total_net_pnl
             
             modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
@@ -202,15 +221,14 @@ class GerenciadorRiscoAutonomo:
                 f"• Status da Catraca: {fase_catraca}\n"
                 f"• PnL Realizado do Ciclo: ${total_net_pnl:+.2f}\n"
                 f"• Saldo Atual da Banca: ${saldo_atual_banca:.2f}\n"
-                f"• Saldo Acumulado Total: ${total_net_pnl:+.2f} USD\n"
             )
             await TelegramLogger.send(msg_fechamento)
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
 
     async def loop_agente_autonomo(self):
-        """Loop contínuo de autonomia financeira e gestão inteligente."""
-        logging.info("🧠 AGENTE AUTÔNOMO COM ALAVANCAGEM LIVRE (1x-100x) E LOTES ($0.001-$10) ONLINE")
+        """Loop contínuo de autonomia financeira e telemetria."""
+        logging.info("🧠 AGENTE AUTÔNOMO COM TELEMETRIA PERIÓDICA (10m) ONLINE")
         while True:
             try:
                 await self.processar_sinais_inbound()
