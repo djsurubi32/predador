@@ -170,7 +170,6 @@ class BybitExecutionEngine:
             return False
 
     async def close_position_limit_chase(self, symbol: str, side: str, amount: float, max_retries: int = 3):
-        # 🛡️ OTIMIZAÇÃO: Menos tentativas, mais velocidade. Fuga de emergência em 35x.
         if not self.private_exchange or not self.is_real_mode: return True
         order_side = 'sell' if side.upper() in ['LONG', 'BUY'] else 'buy'
         remaining_amount = amount
@@ -184,7 +183,6 @@ class BybitExecutionEngine:
 
                 order = await asyncio.to_thread(self.private_exchange.create_order, symbol, 'limit', order_side, float(amount_str), float(price_str), {'reduceOnly': True, 'postOnly': True})
                 
-                # Aguarda apenas meio segundo (Alta Frequência) e não 3 segundos
                 await asyncio.sleep(0.5)
 
                 fetched_order = await asyncio.to_thread(self.private_exchange.fetch_order, order['id'], symbol, params={'acknowledged': True})
@@ -199,7 +197,6 @@ class BybitExecutionEngine:
             except Exception:
                 await asyncio.sleep(0.5)
 
-        # Despejo absoluto a mercado se a liquidez fugir
         if remaining_amount > 0.00001:
             await self.close_position_market(symbol, side, remaining_amount)
         return True
@@ -363,40 +360,41 @@ class EngineExecutor:
         is_fluxo_maximo = "Fluxo:3.0" in reasoning_clean
         is_espaco_expandido = "ML_Espaço:3.0" in reasoning_clean
 
-        # 🛡️ AJUSTE ESTRUTURAL (Alavancagem 35x): Distâncias encurtadas para proteger contra liquidação
         if score >= 9.0 and prob >= 75.0:
             return {
                 "vertente": "QUALIDADE EXTREMA (SNIPER)",
                 "lote_tipo": "Lote Sniper",
                 "invest_amount": 6.0,
-                "tp_factor": 1.025,  # Busca 2.5% de movimento na moeda (ROE 87.5% a 35x)
-                "sl_factor": 0.990   # Tolera apenas 1.0% de oscilação contra (perda de 35% da margem)
+                "tp_factor": 1.025,  
+                "sl_factor": 0.990   
             }
         elif is_fluxo_maximo:
             return {
                 "vertente": "SCALPING DE MOMENTUM",
                 "lote_tipo": "Lote Padrão",
                 "invest_amount": 4.0,
-                "tp_factor": 1.015,  # Busca 1.5% de movimento (ROE 52.5% a 35x)
-                "sl_factor": 0.992   # Tolera apenas 0.8% de oscilação contra
+                "tp_factor": 1.015,  
+                "sl_factor": 0.992   
             }
         elif is_espaco_expandido:
             return {
                 "vertente": "DAY TRADE DE EXPANSÃO",
                 "lote_tipo": "Lote Leve",
                 "invest_amount": 3.0,
-                "tp_factor": 1.020,  # Busca 2.0% de movimento (ROE 70% a 35x)
-                "sl_factor": 0.988   # Tolera 1.2% de oscilação contra
+                "tp_factor": 1.020,  
+                "sl_factor": 0.988   
             }
 
         return {
             "vertente": "PADRÃO ADAPTATIVO",
             "lote_tipo": "Lote de Teste",
             "invest_amount": 2.0,
-            "tp_factor": 1.012,  # Busca 1.2% de movimento (ROE 42% a 35x)
-            "sl_factor": 0.993   # Tolera 0.7% de oscilação contra
+            "tp_factor": 1.012,  
+            "sl_factor": 0.993   
         }
 
+    # As funções macro foram mantidas aqui para que o código não quebre,
+    # mas o seu uso na execução foi desligado mais abaixo.
     async def check_btc_trend_1h(self) -> str:
         try:
             candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, 'BTC/USDT:USDT', '1h', limit=20)
@@ -409,10 +407,21 @@ class EngineExecutor:
             elif current_price < sma: return "BEARISH"
             return "NEUTRAL"
         except Exception as e:
-            logging.error(f"Erro ao checar tendência macro do BTC (1h): {e}")
             return "NEUTRAL"
 
-
+    async def check_asset_trend_4h(self, symbol: str) -> str:
+        try:
+            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '4h', limit=20)
+            if not candles or len(candles) < 20:
+                return "NEUTRAL"
+            closes = [float(c[4]) for c in candles]
+            sma = sum(closes) / len(closes)
+            current_price = closes[-1]
+            if current_price > sma: return "BULLISH"
+            elif current_price < sma: return "BEARISH"
+            return "NEUTRAL"
+        except Exception as e:
+            return "NEUTRAL"
 
     async def check_asset_trend_1h(self, symbol: str) -> str:
         try:
@@ -426,7 +435,6 @@ class EngineExecutor:
             elif current_price < sma: return "BEARISH"
             return "NEUTRAL"
         except Exception as e:
-            logging.error(f"Erro ao checar timeframe macro 1h para {symbol}: {e}")
             return "NEUTRAL"
 
     async def check_open_interest_healthy(self, symbol: str) -> bool:
@@ -451,7 +459,6 @@ class EngineExecutor:
             imbalance = (vol_bids - vol_asks) / (vol_bids + vol_asks + 1e-9)
             return float(imbalance)
         except Exception as e:
-            logging.error(f"Falha ao ler L2 Bybit para {symbol}: {e}")
             return 0.0
 
     async def analisar_delta_volume_bybit(self, symbol: str) -> float:
@@ -470,7 +477,6 @@ class EngineExecutor:
             cvd_ratio = delta_total / (volume_total + 1e-9)
             return float(cvd_ratio)
         except Exception as e:
-            logging.error(f"Falha ao ler Fluxo Bybit para {symbol}: {e}")
             return 0.0
 
     async def validar_microestrutura_bybit(self, symbol: str, direction: str) -> tuple[bool, str]:
@@ -498,7 +504,6 @@ class EngineExecutor:
 
             return aprovado, motivo
         except Exception as e:
-            logging.error(f"Erro no Batedor Local Bybit para {symbol}: {e}")
             return True, "Bybit Local Indisponível - Bypass Automático"
 
     async def reconcile_positions(self):
@@ -550,7 +555,6 @@ class EngineExecutor:
             open_trades = await self.db.get_all_open_trades()
             trade_dict = {t[0]: t for t in open_trades}
 
-            # 🛡️ OTIMIZAÇÃO: Consulta vetorial simultânea na API (Fim do gargalo de rede)
             symbols_to_fetch = [p['symbol'] for p in positions if p['symbol'] in trade_dict]
             if not symbols_to_fetch: return
             
@@ -614,7 +618,7 @@ class EngineExecutor:
                     await TelegramLogger.send(msg)
                     logging.info(msg.replace("\n", " - "))
         except Exception as e:
-            logging.error(f"Erro no monitoramento individual de posições: {e}")
+            pass
 
     async def manage_basket(self):
         positions = await self.execution.get_current_positions(self.db)
@@ -642,21 +646,16 @@ class EngineExecutor:
         current_roe = total_net_pnl / total_margin
         max_roe = self.max_basket_pnl / total_margin
 
-        # 🛡️ OTIMIZAÇÃO: Catraca Móvel Recalibrada contra 'Whipsaws' (Ruídos de Mercado)
-        
-        stop_dinamico_usd = -total_margin * 0.40  # Hard stop da cesta (Limite máximo de 40% de perda sobre a margem)
+        stop_dinamico_usd = -total_margin * 0.40  
         fase_catraca = "INATIVA"
         
         if max_roe >= 0.50:
-            # FASE 3 (Asfixia Final): Permite um recuo de 15% de ROE (Trava o lucro em +35% ROE)
             stop_dinamico_usd = (max_roe - 0.15) * total_margin
             fase_catraca = "ASFIXIA (Fase 3)"
         elif max_roe >= 0.30:
-            # FASE 2 (Fixação): Permite um recuo de 15% de ROE (Trava o lucro em +15% ROE)
             stop_dinamico_usd = (max_roe - 0.15) * total_margin
             fase_catraca = "FIXAÇÃO (Fase 2)"
         elif max_roe >= 0.15:
-            # FASE 1 (Break-Even Dinâmico): Trava no lucro raso (+2% ROE) apenas para garantir o pagamento de taxas da Bybit.
             stop_dinamico_usd = 0.02 * total_margin
             fase_catraca = "BREAK-EVEN (Fase 1)"
 
@@ -695,7 +694,6 @@ class EngineExecutor:
                 amount = float(p.get('contracts', 0))
                 if amount > 0:
                     logging.info(f"Fechando {symbol} ({side}) - Catraca Global")
-                    # Se atingir o trailing stop, nós agredimos rápido o limite com fuga garantida a mercado
                     await self.execution.close_position_limit_chase(symbol, side, amount)
 
                 await self.db.remove_trade(symbol)
@@ -735,9 +733,6 @@ class EngineExecutor:
         buy_positions_count = sum(1 for p in positions if p['side'] in ['LONG', 'BUY'])
         sell_positions_count = sum(1 for p in positions if p['side'] in ['SHORT', 'SELL'])
 
-        # Centralizando chamadas macro para evitar saturação de API
-        btc_trend = await self.check_btc_trend_1h()
-
         for signal in signals:
             symbol = signal['symbol']
 
@@ -757,28 +752,11 @@ class EngineExecutor:
                 logging.info(f"🚫 [TRAVA ANTI-SUICÍDIO] Venda de {symbol} bloqueada. Limite direcional atingido.")
                 continue
 
-            if direction == 'BUY' and btc_trend == 'BEARISH':
-                logging.info(f"🚫 [FILTRO BTC] Compra em {symbol} descartada (BTC em QUEDA no 1h).")
-                continue
-            if direction == 'SELL' and btc_trend == 'BULLISH':
-                logging.info(f"🚫 [FILTRO BTC] Venda em {symbol} descartada (BTC em ALTA no 1h).")
-                continue
-
-            asset_trend_4h = await self.check_asset_trend_4h(symbol)
-            if direction == 'BUY' and asset_trend_4h == 'BEARISH':
-                logging.info(f"🚫 [FILTRO 4H] Compra em {symbol} descartada (Macro 4h é de QUEDA).")
-                continue
-            if direction == 'SELL' and asset_trend_4h == 'BULLISH':
-                logging.info(f"🚫 [FILTRO 4H] Venda em {symbol} descartada (Macro 4h é de ALTA).")
-                continue
-
-            asset_trend_1h = await self.check_asset_trend_1h(symbol)
-            if direction == 'BUY' and asset_trend_1h == 'BEARISH':
-                logging.info(f"🚫 [FILTRO 1H] Compra em {symbol} descartada (Macro 1h é de QUEDA).")
-                continue
-            if direction == 'SELL' and asset_trend_1h == 'BULLISH':
-                logging.info(f"🚫 [FILTRO 1H] Venda em {symbol} descartada (Macro 1h é de ALTA).")
-                continue
+            # =========================================================================
+            # OTIMIZAÇÃO INSTITUCIONAL: FILTROS MACRO DESLIGADOS
+            # O robô agora opera focado na volatilidade extrema do momento (High-Frequency).
+            # A responsabilidade direcional é 100% do Machine Learning e do Oráculo Binance.
+            # =========================================================================
 
             oi_healthy = await self.check_open_interest_healthy(symbol)
             if not oi_healthy:
@@ -805,7 +783,6 @@ class EngineExecutor:
 
             qty = (amount_to_invest * Config.ALAVANCAGEM) / current_price
 
-            # 🛡️ REVERSÃO MATEMÁTICA CORRETA PARA SHORTS (Bidirecionalidade Cripto)
             if direction == 'BUY':
                 tp_price = current_price * strategy["tp_factor"]
                 sl_price = current_price * strategy["sl_factor"]
