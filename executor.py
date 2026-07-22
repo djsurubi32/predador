@@ -412,20 +412,7 @@ class EngineExecutor:
             logging.error(f"Erro ao checar tendência macro do BTC (1h): {e}")
             return "NEUTRAL"
 
-    async def check_asset_trend_4h(self, symbol: str) -> str:
-        try:
-            candles = await asyncio.to_thread(self.public_exchange.fetch_ohlcv, symbol, '4h', limit=20)
-            if not candles or len(candles) < 20:
-                return "NEUTRAL"
-            closes = [float(c[4]) for c in candles]
-            sma = sum(closes) / len(closes)
-            current_price = closes[-1]
-            if current_price > sma: return "BULLISH"
-            elif current_price < sma: return "BEARISH"
-            return "NEUTRAL"
-        except Exception as e:
-            logging.error(f"Erro ao checar timeframe macro 4h para {symbol}: {e}")
-            return "NEUTRAL"
+
 
     async def check_asset_trend_1h(self, symbol: str) -> str:
         try:
