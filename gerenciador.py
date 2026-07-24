@@ -20,34 +20,35 @@ class GerenciadorRiscoAutonomo:
         self.db = self.executor.db
         self.max_basket_pnl = 0.0
         self.min_basket_pnl = 0.0
-        self.last_summary_time = time.time()  # ⏱️ Controle de tempo para o relatório de 10 minutos
+        self.last_summary_time = time.time()  
+        self.banca_acumulada_real = float(Config.BANCA_DEMO_INICIAL) # 💰 Controlo real e persistente do capital
 
-    def calcular_topologia_trade_avancada(self, signal: dict) -> dict:
+    def calcular_topologia_trade_blindada(self, signal: dict) -> dict:
         """
-        🧠 INTELIGÊNCIA QUANTITATIVA INSTITUCIONAL:
-        Calcula de forma contínua e dinâmica a alavancagem (1x a 100x) 
-        e o lote em USD ($0.001 a $10.00) com base na Conviction Score e Volatilidade (ATR).
+        🧠 INTELIGÊNCIA QUANTITATIVA COM ESCUDO DE RISCO:
+        Calcula alavancagem e lote dinâmicos, mas impõe um Hard Cap institucional 
+        (Máximo de 35x de alavancagem e teto de margem) para proteger a banca real.
         """
         score = float(signal.get('score', 5.0))
         prob = float(signal.get('prob', 50.0))
         current_atr = float(signal.get('current_atr', 0.01))
         price = float(signal.get('price', 1.0))
 
-        # 1. Índice Sintético de Convicção (0.0 a 1.0) ponderando Score e Probabilidade
+        # 1. Índice Sintético de Convicção (0.0 a 1.0)
         score_norm = np.clip(score / 10.0, 0.0, 1.0)
         prob_norm = np.clip(prob / 100.0, 0.0, 1.0)
         conviction = (score_norm * 0.6) + (prob_norm * 0.4)
 
-        # 2. Alavancagem Contínua Dinâmica (1x a 100x)
+        # 2. Alavancagem Dinâmica Blindada (Teto Máximo de 35x para timeframe de 15m)
         atr_pct = (current_atr / price) * 100 if price > 0 else 1.0
-        fator_volatilidade = np.clip(1.0 / (atr_pct + 0.1), 0.2, 2.0)
+        fator_volatilidade = np.clip(1.0 / (atr_pct + 0.1), 0.2, 1.5)
         
-        leverage_raw = 1.0 + (conviction ** 2) * 99.0 * fator_volatilidade
-        leverage = int(np.clip(round(leverage_raw), 1, 100))
+        leverage_raw = 1.0 + (conviction ** 2) * 34.0 * fator_volatilidade
+        leverage = int(np.clip(round(leverage_raw), 1, 35)) # 🛡️ HARD CAP: Nunca passa de 35x
 
-        # 3. Lote/Margem em USD Contínuo ($0.001 a $10.00)
-        min_usd = 0.001
-        max_usd = 10.00
+        # 3. Lote/Margem em USD Contínuo (Teto seguro de $5.00 por ordem para não estourar 10 trades)
+        min_usd = 1.00
+        max_usd = 5.00
         invest_amount = min_usd + (conviction ** 1.5) * (max_usd - min_usd)
         invest_amount = float(np.clip(invest_amount, min_usd, max_usd))
 
@@ -69,7 +70,7 @@ class GerenciadorRiscoAutonomo:
         distancia_tp = current_atr * atr_multi_tp
         distancia_sl = current_atr * atr_multi_sl
 
-        max_sl_pct = 0.025  
+        max_sl_pct = 0.020  # Trava o stop em no máximo 2% de oscilação
         if (distancia_sl / price) > max_sl_pct:
             distancia_sl = price * max_sl_pct
 
@@ -93,7 +94,7 @@ class GerenciadorRiscoAutonomo:
         }
 
     async def processar_sinais_inbound(self):
-        """Avalia os sinais e dispara ordens com topologia de risco livre."""
+        """Avalia os sinais e dispara ordens com topologia blindada."""
         signals = await self.db.get_elite_signals()
         if not signals: return
 
@@ -110,7 +111,7 @@ class GerenciadorRiscoAutonomo:
             if time.time() < tempo_liberacao: continue
             if len(open_symbols) >= Config.MAX_OPEN_TRADES: break
 
-            topology = self.calcular_topologia_trade_avancada(signal)
+            topology = self.calcular_topologia_trade_blindada(signal)
 
             order_packet = {
                 'symbol': symbol,
@@ -129,18 +130,18 @@ class GerenciadorRiscoAutonomo:
                 msg = (
                     f"🔬 [{modo_texto}] AGENTE AUTÔNOMO DISPAROU | {topology['vertente']}\n\n"
                     f"Ativo: {symbol} | Direção: {signal['direction']}\n"
-                    f"Margem Alocada: ${topology['invest_amount']:.4f} | Alavancagem: {topology['leverage']}x\n"
+                    f"Margem Alocada: ${topology['invest_amount']:.2f} | Alavancagem: {topology['leverage']}x\n"
                     f"Convicção da IA: {topology['conviction']*100:.1f}% (Score: {signal['score']:.1f} | Prob: {signal['prob']:.1f}%)\n"
                     f"Preço Entrada: ${signal['price']:.5f}\n"
                     f"🎯 Take Profit: ${topology['tp']:.5f} | 🛑 Stop Loss: ${topology['sl']:.5f}\n"
                 )
                 await TelegramLogger.send(msg)
-                logging.info(f"Ordem autônoma processada para {symbol} | Alavancagem: {topology['leverage']}x | Margem: ${topology['invest_amount']:.4f}")
+                logging.info(f"Ordem blindada processada para {symbol} | Alavancagem: {topology['leverage']}x | Margem: ${topology['invest_amount']:.2f}")
 
     async def gerenciar_defesa_elastica_balde(self):
         """
-        🛡️ CATRACA MÓVEL & RELATÓRIO PERIÓDICO DE 10 MINUTOS
-        Monitora posições ativas, gerencia hard stops e envia estatísticas para o Telegram.
+        🛡️ CATRACA MÓVEL & GESTÃO DE RISCO DE BANCA REAL
+        Monitora posições e calcula o saldo real acumulado com base no capital inicial.
         """
         positions = await self.executor.execution.get_current_positions(self.db)
         now = time.time()
@@ -152,7 +153,7 @@ class GerenciadorRiscoAutonomo:
             return
 
         total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
-        total_margin = sum((float(p.get('contracts', 0)) * float(p.get('entryPrice', 0))) / max(1, float(p.get('leverage', 1))) for p in positions)
+        total_margin = sum((float(p.get('contracts', 0)) * float(p.get('entryPrice', 0))) / max(1, float(p.get('leverage', 35))) for p in positions)
 
         if total_margin <= 0: return
 
@@ -162,11 +163,14 @@ class GerenciadorRiscoAutonomo:
         current_roe = total_net_pnl / total_margin
         max_roe = self.max_basket_pnl / total_margin
 
-        # Hard Stop Global de Segurança (-70% ROE)
-        stop_dinamico_usd = -total_margin * 0.70  
+        # 🛡️ HARD STOP GLOBAL SEGURO: Baseado no capital total e não na margem alocada
+        banca_base = float(Config.BANCA_DEMO_INICIAL)
+        patrimonio_atual = banca_base + total_net_pnl
+        
+        # Se o PnL flutuante negativo consumir mais de 40% da banca total, o balde defende
+        limite_perda_banca = -banca_base * 0.40 
         fase_catraca = "INATIVA"
         
-        # Fases da Catraca Móvel
         if max_roe >= 0.60:
             stop_dinamico_usd = (max_roe - 0.15) * total_margin
             fase_catraca = "ASFIXIA (Fase 3)"
@@ -176,29 +180,29 @@ class GerenciadorRiscoAutonomo:
         elif max_roe >= 0.20:
             stop_dinamico_usd = 0.02 * total_margin
             fase_catraca = "BREAK-EVEN (Fase 1)"
+        else:
+            stop_dinamico_usd = limite_perda_banca
 
-        # ⏱️ RELATÓRIO PERIÓDICO DE 10 MINUTOS (Raio-X do Balde para o Telegram)
+        # ⏱️ RELATÓRIO PERIÓDICO DE 10 MINUTOS (Raio-X do Balde Blindado)
         if now - self.last_summary_time >= 600:
             self.last_summary_time = now
             modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
-            banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
-            saldo_atual = banca_inicial + total_net_pnl
 
             resumo_msg = (
                 f"⏱️ <b>RAIO-X DO BALDE (10 min)</b> [{modo_texto}]\n\n"
                 f"🔹 <b>Operações Ativas:</b> {len(positions)}/{Config.MAX_OPEN_TRADES}\n"
                 f"🔹 <b>Margem Alocada:</b> ${total_margin:.2f}\n"
                 f"🔹 <b>PnL Atual Flutuante:</b> ${total_net_pnl:+.2f} ({current_roe * 100:.1f}% ROE)\n\n"
-                f"📈 <b>Topo (Max PnL):</b> ${self.max_basket_pnl:.2f} ({max_roe * 100:.1f}% ROE)\n"
+                f"📈 <b>Topo (Max PnL):</b> ${self.max_basket_pnl:.2f}\n"
                 f"📉 <b>Fundo (Min PnL):</b> ${self.min_basket_pnl:.2f}\n\n"
                 f"🔒 <b>Catraca Ativa:</b> {fase_catraca}\n"
-                f"💰 <b>Saldo Estimado da Banca:</b> ${saldo_atual:.2f}\n"
-                f"🛑 <b>Gatilho de Fechamento em:</b> ${stop_dinamico_usd:.2f}"
+                f"💰 <b>Patrimônio Estimado:</b> ${patrimonio_atual:.2f}\n"
+                f"🛑 <b>Gatilho de Defesa Global:</b> ${stop_dinamico_usd:.2f}"
             )
             await TelegramLogger.send(resumo_msg)
-            logging.info("⏱️ Relatório de Raio-X do Balde enviado com sucesso para o Telegram.")
+            logging.info("⏱️ Relatório de Raio-X do Balde Blindado enviado para o Telegram.")
 
-        # Disparo da Defesa Global se o PnL atingir o stop dinâmico
+        # Disparo da Defesa Global
         if total_net_pnl <= stop_dinamico_usd:
             logging.warning(f"🚨 DEFESA GLOBAL ACIONADA: Fechamento preventivo via {fase_catraca}")
             
@@ -211,24 +215,22 @@ class GerenciadorRiscoAutonomo:
                     pnl=total_net_pnl / len(positions)
                 )
 
-            banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
-            saldo_atual_banca = banca_inicial + total_net_pnl
-            
+            patrimonio_final = banca_base + total_net_pnl
             modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
             msg_fechamento = (
                 f"🚨 [{modo_texto}] DEFESA GLOBAL ACIONADA (CESTA LIQUIDADA)\n\n"
                 f"📊 RELATÓRIO FINANCEIRO DE ENCERRAMENTO:\n"
                 f"• Status da Catraca: {fase_catraca}\n"
                 f"• PnL Realizado do Ciclo: ${total_net_pnl:+.2f}\n"
-                f"• Saldo Atual da Banca: ${saldo_atual_banca:.2f}\n"
+                f"• Patrimônio Final da Banca: ${patrimonio_final:.2f}\n"
             )
             await TelegramLogger.send(msg_fechamento)
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
 
     async def loop_agente_autonomo(self):
-        """Loop contínuo de autonomia financeira e telemetria."""
-        logging.info("🧠 AGENTE AUTÔNOMO COM TELEMETRIA PERIÓDICA (10m) ONLINE")
+        """Loop contínuo de autonomia financeira e telemetria blindada."""
+        logging.info("🧠 AGENTE AUTÔNOMO BLINDADO (Teto de 35x e Lotes Controlados) ONLINE")
         while True:
             try:
                 await self.processar_sinais_inbound()
