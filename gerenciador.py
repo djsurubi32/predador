@@ -22,13 +22,11 @@ class GerenciadorRiscoAutonomo:
         self.max_basket_pnl = 0.0
         self.min_basket_pnl = 0.0
         self.last_summary_time = time.time()
-        self.trade_history_buffer = []
 
     def calcular_topologia_trade_avancada(self, signal: dict) -> dict:
         """
-        🧠 INTELIGÊNCIA QUANTITATIVA INSTITUCIONAL & ASSIMETRIA MATEMÁTICA:
-        Calcula alavancagem (1x a 100x) e lote em USD ($0.001 a $10.00) 
-        garantindo Payoff assimétrico (> 2:1) para suportar winrates baixos.
+        🧠 INTELIGÊNCIA QUANTITATIVA INSTITUCIONAL & CONTROLE DE MARGEM REAL:
+        Garante que o capital alocado por trade respeite estritamente o teto da banca.
         """
         score = float(signal.get('score', 5.0))
         prob = float(signal.get('prob', 50.0))
@@ -45,17 +43,16 @@ class GerenciadorRiscoAutonomo:
         leverage_raw = 1.0 + (conviction ** 2) * 99.0 * fator_volatilidade
         leverage = int(np.clip(round(leverage_raw), 1, 100))
 
-        min_usd = 0.001
-        max_usd = 10.00
+        # Respeita o teto máximo de investimento por ordem (limite seguro para banca pequena)
+        min_usd = 0.50
+        max_usd = 10.00 # Teto individual por trade para não estourar a banca de $100-$133
         
-        # Kelly Fracionado aplicado ao dimensionamento base
         kelly_fraction = 0.25 
         base_invest = min_usd + (conviction ** 1.5) * (max_usd - min_usd)
         invest_amount = float(np.clip(base_invest * kelly_fraction, min_usd, max_usd))
 
         asset_type = signal.get('asset_type', 'CRYPTO')
         
-        # Garante Assimetria Risco-Retorno (Payoff > 2:1) para alta expectativa matemática
         if asset_type == 'FOREX':
             atr_multi_tp, atr_multi_sl = 2.2, 0.9
         elif asset_type == 'STOCK':
@@ -153,41 +150,50 @@ class GerenciadorRiscoAutonomo:
             self.last_summary_time = now
             return
 
+        banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
         total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
+        
+        # Correção crucial: Margem real alocada dividida pela alavancagem de cada contrato
         total_margin = sum((float(p.get('contracts', 0)) * float(p.get('entryPrice', 0))) / max(1, float(p.get('leverage', 1))) for p in positions)
+        
+        # Limita visualmente e de forma lógica para não ultrapassar a banca real
+        if total_margin > banca_inicial * 2:
+            total_margin = sum(float(p.get('initialMargin', 5.0)) for p in positions) if 'initialMargin' in positions[0] else banca_inicial * 0.8
 
-        if total_margin <= 0: return
+        if total_margin <= 0: total_margin = 1.0
 
         if total_net_pnl > self.max_basket_pnl: self.max_basket_pnl = total_net_pnl
         if total_net_pnl < self.min_basket_pnl: self.min_basket_pnl = total_net_pnl
 
-        current_roe = total_net_pnl / total_margin
-        max_roe = self.max_basket_pnl / total_margin
+        # Cálculo do ROE baseado na Banca Inicial de $100 (ou capital real da conta)
+        current_roe = total_net_pnl / banca_inicial
+        max_roe = self.max_basket_pnl / banca_inicial
 
-        stop_dinamico_usd = -total_margin * 0.70  
+        # Hard Stop Global de Segurança (-30% da banca total)
+        stop_dinamico_usd = -banca_inicial * 0.30  
         fase_catraca = "INATIVA"
         
-        if max_roe >= 0.60:
-            stop_dinamico_usd = (max_roe - 0.15) * total_margin
+        # Fases da Catraca corrigidas para percentuais reais da banca ($100)
+        if max_roe >= 0.25: # Com 25% de lucro na banca ($25), trava o lucro em 10%
+            stop_dinamico_usd = banca_inicial * 0.10
             fase_catraca = "ASFIXIA (Fase 3)"
-        elif max_roe >= 0.35:
-            stop_dinamico_usd = (max_roe - 0.15) * total_margin
+        elif max_roe >= 0.15: # Com 15% de lucro ($15), trava em 5%
+            stop_dinamico_usd = banca_inicial * 0.05
             fase_catraca = "FIXAÇÃO (Fase 2)"
-        elif max_roe >= 0.20:
-            stop_dinamico_usd = 0.02 * total_margin
+        elif max_roe >= 0.08: # Com 8% de lucro ($8), vai para o Break-Even (0%)
+            stop_dinamico_usd = 0.0
             fase_catraca = "BREAK-EVEN (Fase 1)"
 
         if now - self.last_summary_time >= 600:
             self.last_summary_time = now
             modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
-            banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
             saldo_atual = banca_inicial + total_net_pnl
 
             resumo_msg = (
                 f"⏱️ <b>RAIO-X DO BALDE (10 min)</b> [{modo_texto}]\n\n"
                 f"🔹 <b>Operações Ativas:</b> {len(positions)}/{Config.MAX_OPEN_TRADES}\n"
-                f"🔹 <b>Margem Alocada:</b> ${total_margin:.2f}\n"
-                f"🔹 <b>PnL Atual Flutuante:</b> ${total_net_pnl:+.2f} ({current_roe * 100:.1f}% ROE)\n\n"
+                f"🔹 <b>Margem Alocada Real:</b> ${total_margin:.2f}\n"
+                f"🔹 <b>PnL Atual Flutuante:</b> ${total_net_pnl:+.2f} ({current_roe * 100:.1f}% sobre a Banca)\n\n"
                 f"📈 <b>Topo (Max PnL):</b> ${self.max_basket_pnl:.2f} ({max_roe * 100:.1f}% ROE)\n"
                 f"📉 <b>Fundo (Min PnL):</b> ${self.min_basket_pnl:.2f}\n\n"
                 f"🔒 <b>Catraca Ativa:</b> {fase_catraca}\n"
@@ -211,9 +217,7 @@ class GerenciadorRiscoAutonomo:
             ]
             await asyncio.gather(*close_tasks, return_exceptions=True)
 
-            banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
             saldo_atual_banca = banca_inicial + total_net_pnl
-            
             modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
             msg_fechamento = (
                 f"🚨 [{modo_texto}] DEFESA GLOBAL ACIONADA (CESTA LIQUIDADA)\n\n"
@@ -243,4 +247,3 @@ if __name__ == "__main__":
         asyncio.run(gerenciador.loop_agente_autonomo())
     except KeyboardInterrupt:
         logging.info("🛑 Gerenciador autônomo desligado pelo operador.")
-            
