@@ -24,8 +24,9 @@ class GerenciadorRiscoAutonomo:
         self.last_summary_time = time.time()
         self.trade_history_buffer = []
         
-        # 🧠 RASTREADOR INTERNO DE MARGEM (A Fonte da Verdade)
+        # 🧠 RASTREADOR INTERNO DE MARGEM E LUCRO ACUMULADO
         self.margens_ativas = {}
+        self.pnl_realizado_acumulado = 0.0  # Guarda o lucro/prejuízo das cestas já fechadas nesta sessão
 
     def calcular_topologia_trade_avancada(self, signal: dict) -> dict:
         score = float(signal.get('score', 5.0))
@@ -123,7 +124,6 @@ class GerenciadorRiscoAutonomo:
             if sucesso:
                 open_symbols.add(symbol)
                 
-                # 💾 GRAVA NA MEMÓRIA A MARGEM EXATA ALOCADA PARA NÃO DEPENDER DA CORRETORA
                 self.margens_ativas[symbol] = topology['invest_amount']
                 
                 modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
@@ -146,18 +146,17 @@ class GerenciadorRiscoAutonomo:
             return
 
         now = time.time()
+        banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
 
         if not positions:
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
             self.last_summary_time = now
-            self.margens_ativas.clear() # Limpa a memória se não há posições
+            self.margens_ativas.clear() 
             return
 
-        banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
         total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
         
-        # 🛡️ EXTRATOR BASEADO NA FONTE DA VERDADE INTERNA
         total_margin = 0.0
         symbols_ativos_corretora = set()
 
@@ -165,34 +164,26 @@ class GerenciadorRiscoAutonomo:
             symbol = p.get('symbol')
             symbols_ativos_corretora.add(symbol)
             
-            # Se o robô abriu a ordem nesta sessão, ele sabe exatamente quanto gastou
             if symbol in self.margens_ativas:
                 real_margin = self.margens_ativas[symbol]
             else:
-                # Fallback: Se o robô reiniciou e perdeu a memória RAM
                 qty = float(p.get('contracts', p.get('amount', p.get('size', 0.0))))
                 price = float(p.get('entryPrice', p.get('price', 0.0)))
                 notional = qty * price
                 
                 if getattr(Config, 'OPERA_CONTA_REAL', False):
-                    # Tenta ler da corretora real
                     lev = float(p.get('leverage', 1.0))
                     real_margin = notional / max(1.0, lev)
                 else:
-                    # SIMULAÇÃO: Dedução matemática segura usando a média do bot
-                    # Usa o numpy (np.clip) para garantir que a margem inferida ficará entre $0.50 e $10.00
-                    margem_estimada = notional / 50.0  # Assumindo alavancagem média de 50x
+                    margem_estimada = notional / 50.0  
                     real_margin = float(np.clip(margem_estimada, 0.50, 10.00))
                     
-                # Regrava na memória para não calcular novamente
                 self.margens_ativas[symbol] = real_margin
 
             total_margin += real_margin
 
-        # Limpeza de Memória: Remove ativos que já fecharam na corretora
         self.margens_ativas = {sym: margem for sym, margem in self.margens_ativas.items() if sym in symbols_ativos_corretora}
 
-        # Fallback anti-quebra matemático
         if total_margin <= 0: total_margin = 1.0
 
         if total_net_pnl > self.max_basket_pnl: self.max_basket_pnl = total_net_pnl
@@ -201,7 +192,6 @@ class GerenciadorRiscoAutonomo:
         current_roe = total_net_pnl / total_margin
         max_roe = self.max_basket_pnl / total_margin
 
-        # Stop Global de 70% perfeitamente ancorado ao que saiu da banca
         stop_dinamico_usd = -total_margin * 0.70  
         fase_catraca = "INATIVA"
         
@@ -215,10 +205,13 @@ class GerenciadorRiscoAutonomo:
             stop_dinamico_usd = 0.0
             fase_catraca = "BREAK-EVEN (Fase 1)"
 
+        # Calcula o saldo real somando a base com os lucros já fechados e o flutuante atual
+        saldo_base_sessao = banca_inicial + self.pnl_realizado_acumulado
+        saldo_atual_estimado = saldo_base_sessao + total_net_pnl
+
         if now - self.last_summary_time >= 600:
             self.last_summary_time = now
             modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
-            saldo_atual = banca_inicial + total_net_pnl
 
             resumo_msg = (
                 f"⏱️ <b>RAIO-X DO BALDE (10 min)</b> [{modo_texto}]\n\n"
@@ -228,7 +221,7 @@ class GerenciadorRiscoAutonomo:
                 f"📈 <b>Topo (Max PnL):</b> ${self.max_basket_pnl:.2f} ({max_roe * 100:.1f}% ROE)\n"
                 f"📉 <b>Fundo (Min PnL):</b> ${self.min_basket_pnl:.2f}\n\n"
                 f"🔒 <b>Catraca Ativa:</b> {fase_catraca}\n"
-                f"💰 <b>Saldo Estimado da Banca:</b> ${saldo_atual:.2f}\n"
+                f"💰 <b>Saldo Estimado da Banca:</b> ${saldo_atual_estimado:.2f}\n"
                 f"🛑 <b>Gatilho de Fechamento em:</b> ${stop_dinamico_usd:.2f}"
             )
             await TelegramLogger.send(resumo_msg)
@@ -248,16 +241,20 @@ class GerenciadorRiscoAutonomo:
             ]
             await asyncio.gather(*close_tasks, return_exceptions=True)
 
-            saldo_atual_banca = banca_inicial + total_net_pnl
+            # Grava o PnL fechado na memória para a próxima cesta
+            self.pnl_realizado_acumulado += total_net_pnl
+            saldo_final_ciclo = banca_inicial + self.pnl_realizado_acumulado
+            
             modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
             msg_fechamento = (
                 f"🚨 [{modo_texto}] DEFESA GLOBAL ACIONADA (CESTA LIQUIDADA)\n\n"
                 f"📊 RELATÓRIO FINANCEIRO DE ENCERRAMENTO:\n"
                 f"• Status da Catraca: {fase_catraca}\n"
                 f"• PnL Realizado do Ciclo: ${total_net_pnl:+.2f}\n"
-                f"• Saldo Atual da Banca: ${saldo_atual_banca:.2f}\n"
+                f"• Saldo Atual da Banca: ${saldo_final_ciclo:.2f}\n"
             )
             await TelegramLogger.send(msg_fechamento)
+            
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
             self.margens_ativas.clear()
