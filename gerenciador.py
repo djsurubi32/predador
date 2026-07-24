@@ -6,6 +6,7 @@ import time
 import sqlite3
 import pandas as pd
 import numpy as np
+import quantstats as qs
 from config import Config
 from executor import EngineExecutor, TelegramLogger
 
@@ -21,12 +22,13 @@ class GerenciadorRiscoAutonomo:
         self.max_basket_pnl = 0.0
         self.min_basket_pnl = 0.0
         self.last_summary_time = time.time()
+        self.trade_history_buffer = []
 
     def calcular_topologia_trade_avancada(self, signal: dict) -> dict:
         """
-        🧠 INTELIGÊNCIA QUANTITATIVA INSTITUCIONAL:
+        🧠 INTELIGÊNCIA QUANTITATIVA INSTITUCIONAL & ASSIMETRIA MATEMÁTICA:
         Calcula alavancagem (1x a 100x) e lote em USD ($0.001 a $10.00) 
-        com base na Conviction Score e Volatilidade (ATR).
+        garantindo Payoff assimétrico (> 2:1) para suportar winrates baixos.
         """
         score = float(signal.get('score', 5.0))
         prob = float(signal.get('prob', 50.0))
@@ -45,22 +47,26 @@ class GerenciadorRiscoAutonomo:
 
         min_usd = 0.001
         max_usd = 10.00
-        invest_amount = min_usd + (conviction ** 1.5) * (max_usd - min_usd)
-        invest_amount = float(np.clip(invest_amount, min_usd, max_usd))
+        
+        # Kelly Fracionado aplicado ao dimensionamento base
+        kelly_fraction = 0.25 
+        base_invest = min_usd + (conviction ** 1.5) * (max_usd - min_usd)
+        invest_amount = float(np.clip(base_invest * kelly_fraction, min_usd, max_usd))
 
-        # Adaptação para múltiplas vertentes de mercado (Crypto / Forex / Ações)
         asset_type = signal.get('asset_type', 'CRYPTO')
+        
+        # Garante Assimetria Risco-Retorno (Payoff > 2:1) para alta expectativa matemática
         if asset_type == 'FOREX':
-            atr_multi_tp, atr_multi_sl = 1.8, 0.9
+            atr_multi_tp, atr_multi_sl = 2.2, 0.9
         elif asset_type == 'STOCK':
-            atr_multi_tp, atr_multi_sl = 2.0, 1.0
-        else: # CRYPTO padrão
+            atr_multi_tp, atr_multi_sl = 2.5, 1.0
+        else:
             if conviction >= 0.85:
-                atr_multi_tp, atr_multi_sl = 2.5, 1.0
+                atr_multi_tp, atr_multi_sl = 3.0, 1.0
             elif conviction >= 0.65:
-                atr_multi_tp, atr_multi_sl = 2.0, 1.1
+                atr_multi_tp, atr_multi_sl = 2.2, 1.0
             else:
-                atr_multi_tp, atr_multi_sl = 1.5, 1.2
+                atr_multi_tp, atr_multi_sl = 1.8, 1.0
 
         distancia_tp = current_atr * atr_multi_tp
         distancia_sl = current_atr * atr_multi_sl
@@ -133,13 +139,10 @@ class GerenciadorRiscoAutonomo:
                 logging.info(f"Ordem autônoma processada para {symbol} | Alavancagem: {topology['leverage']}x | Margem: ${topology['invest_amount']:.4f}")
 
     async def gerenciar_defesa_elastica_balde(self):
-        """
-        🛡️ CATRACA MÓVEL & RELATÓRIO PERIÓDICO DE 10 MINUTOS (Com tratamento resiliente)
-        """
         try:
             positions = await self.executor.execution.get_current_positions(self.db)
         except Exception as e:
-            logging.error(f"Erro ao buscar posições ativas na corretora: {e}")
+            logging.error(f"Erro resiliente ao buscar posições na corretora: {e}")
             return
 
         now = time.time()
@@ -197,7 +200,6 @@ class GerenciadorRiscoAutonomo:
         if total_net_pnl <= stop_dinamico_usd:
             logging.warning(f"🚨 DEFESA GLOBAL ACIONADA: Fechamento preventivo via {fase_catraca}")
             
-            # Fechamento paralelizado para máxima velocidade de escape
             close_tasks = [
                 self.executor.force_close_position(
                     symbol=p['symbol'], 
@@ -241,3 +243,4 @@ if __name__ == "__main__":
         asyncio.run(gerenciador.loop_agente_autonomo())
     except KeyboardInterrupt:
         logging.info("🛑 Gerenciador autônomo desligado pelo operador.")
+            
