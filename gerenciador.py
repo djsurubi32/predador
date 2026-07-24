@@ -149,11 +149,26 @@ class GerenciadorRiscoAutonomo:
         banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
         total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
         
-        total_margin = sum((float(p.get('contracts', 0)) * float(p.get('entryPrice', 0))) / max(1, float(p.get('leverage', 1))) for p in positions)
-        
-        if total_margin > banca_inicial * 2:
-            total_margin = sum(float(p.get('initialMargin', 5.0)) for p in positions) if 'initialMargin' in positions[0] else banca_inicial * 0.8
+        # CORREÇÃO: Extração cirúrgica da Margem Real (Apenas o que saiu do seu bolso)
+        total_margin = 0.0
+        for p in positions:
+            real_margin = float(p.get('initialMargin', 0))
+            
+            if real_margin == 0:
+                contratos = float(p.get('contracts', 0))
+                preco = float(p.get('entryPrice', 0))
+                alavancagem = float(p.get('leverage', 0))
+                
+                # Cobre o cenário onde a API esconde a alavancagem dentro de 'info'
+                if alavancagem == 0 and 'info' in p:
+                    alavancagem = float(p['info'].get('leverage', 1))
+                    
+                alavancagem = max(1.0, alavancagem) # Trava segurança contra divisão por zero
+                real_margin = (contratos * preco) / alavancagem
+                
+            total_margin += real_margin
 
+        # Fallback de segurança caso ocorra falha de leitura (evita dividir por zero no ROE)
         if total_margin <= 0: total_margin = 1.0
 
         if total_net_pnl > self.max_basket_pnl: self.max_basket_pnl = total_net_pnl
@@ -165,9 +180,8 @@ class GerenciadorRiscoAutonomo:
         stop_dinamico_usd = -banca_inicial * 0.30  
         fase_catraca = "INATIVA"
         
-        # MATEMÁTICA DA CATRACA DINÂMICA CORRIGIDA
+        # MATEMÁTICA DA CATRACA DINÂMICA
         if max_roe >= 0.25: 
-            # Trailing dinâmico: Topo histórico menos 15% de margem de respiro
             stop_dinamico_usd = (max_roe - 0.15) * banca_inicial
             fase_catraca = "ASFIXIA CONTÍNUA (Fase 3)"
         elif max_roe >= 0.15: 
@@ -240,3 +254,4 @@ if __name__ == "__main__":
         asyncio.run(gerenciador.loop_agente_autonomo())
     except KeyboardInterrupt:
         logging.info("🛑 Gerenciador autônomo desligado pelo operador.")
+                    
