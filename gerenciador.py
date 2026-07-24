@@ -23,6 +23,9 @@ class GerenciadorRiscoAutonomo:
         self.min_basket_pnl = 0.0
         self.last_summary_time = time.time()
         self.trade_history_buffer = []
+        
+        # 🧠 RASTREADOR INTERNO DE MARGEM (A Fonte da Verdade)
+        self.margens_ativas = {}
 
     def calcular_topologia_trade_avancada(self, signal: dict) -> dict:
         score = float(signal.get('score', 5.0))
@@ -119,6 +122,10 @@ class GerenciadorRiscoAutonomo:
             
             if sucesso:
                 open_symbols.add(symbol)
+                
+                # 💾 GRAVA NA MEMÓRIA A MARGEM EXATA ALOCADA PARA NÃO DEPENDER DA CORRETORA
+                self.margens_ativas[symbol] = topology['invest_amount']
+                
                 modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
                 msg = (
                     f"🔬 [{modo_texto}] AGENTE AUTÔNOMO DISPAROU | {topology['vertente']}\n\n"
@@ -144,63 +151,60 @@ class GerenciadorRiscoAutonomo:
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
             self.last_summary_time = now
+            self.margens_ativas.clear() # Limpa a memória se não há posições
             return
 
         banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
         total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
         
-        # EXTRATOR BLINDADO DE MARGEM REAL (CORRIGIDO)
+        # 🛡️ EXTRATOR BASEADO NA FONTE DA VERDADE INTERNA
         total_margin = 0.0
+        symbols_ativos_corretora = set()
+
         for p in positions:
-            # 1. Pega as métricas brutas de quantidade e preço
-            qty = float(p.get('contracts', p.get('amount', p.get('size', 0.0))))
-            price = float(p.get('entryPrice', p.get('price', 0.0)))
-            notional = qty * price
+            symbol = p.get('symbol')
+            symbols_ativos_corretora.add(symbol)
             
-            # 2. Caçada implacável à alavancagem
-            lev = 1.0
-            if p.get('leverage') and float(p['leverage']) > 0:
-                lev = float(p['leverage'])
-            elif 'info' in p and isinstance(p['info'], dict):
-                info = p['info']
-                if info.get('leverage') and float(info['leverage']) > 0:
-                    lev = float(info['leverage'])
-                    
-            # 3. Calcula a margem matemática pura (o que realmente saiu da banca)
-            lev = max(1.0, lev)
-            margin_calculada = notional / lev
-            
-            # 4. Busca margens reportadas pela API
-            margin_api = float(p.get('initialMargin', 0.0))
-            if margin_api == 0.0 and 'info' in p and isinstance(p['info'], dict):
-                info = p['info']
-                margin_api = float(info.get('positionInitialMargin', info.get('positionMargin', 0.0)))
-                
-            # 5. Sistema de decisão de segurança: 
-            # Só aceita a margem da API se ela for maior que zero E explicitamente menor que o volume total.
-            # Se a margem da API for igual ao Notional, a corretora enviou lixo, então usamos a matemática pura.
-            if 0 < margin_api < notional:
-                real_margin = margin_api
+            # Se o robô abriu a ordem nesta sessão, ele sabe exatamente quanto gastou
+            if symbol in self.margens_ativas:
+                real_margin = self.margens_ativas[symbol]
             else:
-                real_margin = margin_calculada
+                # Fallback: Se o robô reiniciou e perdeu a memória RAM
+                qty = float(p.get('contracts', p.get('amount', p.get('size', 0.0))))
+                price = float(p.get('entryPrice', p.get('price', 0.0)))
+                notional = qty * price
                 
+                if getattr(Config, 'OPERA_CONTA_REAL', False):
+                    # Tenta ler da corretora real
+                    lev = float(p.get('leverage', 1.0))
+                    real_margin = notional / max(1.0, lev)
+                else:
+                    # SIMULAÇÃO: Dedução matemática segura usando a média do bot
+                    # Usa o numpy (np.clip) para garantir que a margem inferida ficará entre $0.50 e $10.00
+                    margem_estimada = notional / 50.0  # Assumindo alavancagem média de 50x
+                    real_margin = float(np.clip(margem_estimada, 0.50, 10.00))
+                    
+                # Regrava na memória para não calcular novamente
+                self.margens_ativas[symbol] = real_margin
+
             total_margin += real_margin
 
-        # Fallback anti-quebra
+        # Limpeza de Memória: Remove ativos que já fecharam na corretora
+        self.margens_ativas = {sym: margem for sym, margem in self.margens_ativas.items() if sym in symbols_ativos_corretora}
+
+        # Fallback anti-quebra matemático
         if total_margin <= 0: total_margin = 1.0
 
         if total_net_pnl > self.max_basket_pnl: self.max_basket_pnl = total_net_pnl
         if total_net_pnl < self.min_basket_pnl: self.min_basket_pnl = total_net_pnl
 
-        # AGORA O ROE É MEDIDO SOBRE O CAPITAL EXPOSTO REAL
         current_roe = total_net_pnl / total_margin
         max_roe = self.max_basket_pnl / total_margin
 
-        # Stop Global de 70% apenas sobre a MARGEM ALOCADA
+        # Stop Global de 70% perfeitamente ancorado ao que saiu da banca
         stop_dinamico_usd = -total_margin * 0.70  
         fase_catraca = "INATIVA"
         
-        # MATEMÁTICA DA CATRACA DINÂMICA
         if max_roe >= 0.50:
             stop_dinamico_usd = (max_roe - 0.20) * total_margin
             fase_catraca = "ASFIXIA CONTÍNUA (Fase 3)"
@@ -256,6 +260,7 @@ class GerenciadorRiscoAutonomo:
             await TelegramLogger.send(msg_fechamento)
             self.max_basket_pnl = 0.0
             self.min_basket_pnl = 0.0
+            self.margens_ativas.clear()
 
     async def loop_agente_autonomo(self):
         logging.info("🧠 AGENTE AUTÔNOMO COM TELEMETRIA PERIÓDICA (10m) ONLINE")
@@ -274,4 +279,3 @@ if __name__ == "__main__":
         asyncio.run(gerenciador.loop_agente_autonomo())
     except KeyboardInterrupt:
         logging.info("🛑 Gerenciador autônomo desligado pelo operador.")
-            
