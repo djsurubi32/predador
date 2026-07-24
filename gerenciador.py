@@ -149,35 +149,41 @@ class GerenciadorRiscoAutonomo:
         banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
         total_net_pnl = sum(float(p.get('netPnl', 0)) for p in positions)
         
-        # EXTRATOR BLINDADO DE MARGEM REAL
+        # EXTRATOR BLINDADO DE MARGEM REAL (CORRIGIDO)
         total_margin = 0.0
         for p in positions:
-            real_margin = float(p.get('initialMargin', 0.0))
+            # 1. Pega as métricas brutas de quantidade e preço
+            qty = float(p.get('contracts', p.get('amount', p.get('size', 0.0))))
+            price = float(p.get('entryPrice', p.get('price', 0.0)))
+            notional = qty * price
             
-            if real_margin == 0.0:
-                # Busca as métricas brutas
-                qty = float(p.get('contracts', p.get('amount', p.get('size', 0.0))))
-                price = float(p.get('entryPrice', p.get('price', 0.0)))
-                notional = qty * price
-                
-                # Caçada à alavancagem real nos metadados da corretora
-                lev = 1.0
-                if p.get('leverage'):
-                    lev = float(p['leverage'])
-                elif 'info' in p and isinstance(p['info'], dict):
-                    info = p['info']
-                    if info.get('leverage'):
-                        lev = float(info['leverage'])
-                    elif info.get('positionInitialMargin'): # Padrão Binance
-                        real_margin = float(info['positionInitialMargin'])
-                    elif info.get('positionMargin'): # Padrão Bybit
-                        real_margin = float(info['positionMargin'])
-                        
-                # Se não achou a margem pronta, calcula com a alavancagem encontrada
-                if real_margin == 0.0 and notional > 0:
-                    lev = max(1.0, float(lev))
-                    real_margin = notional / lev
+            # 2. Caçada implacável à alavancagem
+            lev = 1.0
+            if p.get('leverage') and float(p['leverage']) > 0:
+                lev = float(p['leverage'])
+            elif 'info' in p and isinstance(p['info'], dict):
+                info = p['info']
+                if info.get('leverage') and float(info['leverage']) > 0:
+                    lev = float(info['leverage'])
                     
+            # 3. Calcula a margem matemática pura (o que realmente saiu da banca)
+            lev = max(1.0, lev)
+            margin_calculada = notional / lev
+            
+            # 4. Busca margens reportadas pela API
+            margin_api = float(p.get('initialMargin', 0.0))
+            if margin_api == 0.0 and 'info' in p and isinstance(p['info'], dict):
+                info = p['info']
+                margin_api = float(info.get('positionInitialMargin', info.get('positionMargin', 0.0)))
+                
+            # 5. Sistema de decisão de segurança: 
+            # Só aceita a margem da API se ela for maior que zero E explicitamente menor que o volume total.
+            # Se a margem da API for igual ao Notional, a corretora enviou lixo, então usamos a matemática pura.
+            if 0 < margin_api < notional:
+                real_margin = margin_api
+            else:
+                real_margin = margin_calculada
+                
             total_margin += real_margin
 
         # Fallback anti-quebra
@@ -186,22 +192,22 @@ class GerenciadorRiscoAutonomo:
         if total_net_pnl > self.max_basket_pnl: self.max_basket_pnl = total_net_pnl
         if total_net_pnl < self.min_basket_pnl: self.min_basket_pnl = total_net_pnl
 
-        # AGORA O ROE É MEDIDO SOBRE O CAPITAL EXPOSTO, NÃO SOBRE A BANCA PARADA
+        # AGORA O ROE É MEDIDO SOBRE O CAPITAL EXPOSTO REAL
         current_roe = total_net_pnl / total_margin
         max_roe = self.max_basket_pnl / total_margin
 
-        # Stop Global de 70% apenas sobre a MARGEM ALOCADA (Ex: se alocou $8, stop é -$5.60)
+        # Stop Global de 70% apenas sobre a MARGEM ALOCADA
         stop_dinamico_usd = -total_margin * 0.70  
         fase_catraca = "INATIVA"
         
-        # MATEMÁTICA DA CATRACA DINÂMICA (Sobre a margem alocada)
-        if max_roe >= 0.50: # 50% de lucro sobre o investido
+        # MATEMÁTICA DA CATRACA DINÂMICA
+        if max_roe >= 0.50:
             stop_dinamico_usd = (max_roe - 0.20) * total_margin
             fase_catraca = "ASFIXIA CONTÍNUA (Fase 3)"
-        elif max_roe >= 0.25: # 25% de lucro sobre o investido
+        elif max_roe >= 0.25:
             stop_dinamico_usd = total_margin * 0.10
             fase_catraca = "FIXAÇÃO (Fase 2)"
-        elif max_roe >= 0.10: # 10% de lucro sobre o investido
+        elif max_roe >= 0.10:
             stop_dinamico_usd = 0.0
             fase_catraca = "BREAK-EVEN (Fase 1)"
 
@@ -268,4 +274,4 @@ if __name__ == "__main__":
         asyncio.run(gerenciador.loop_agente_autonomo())
     except KeyboardInterrupt:
         logging.info("🛑 Gerenciador autônomo desligado pelo operador.")
-                
+            
