@@ -425,31 +425,31 @@ class RadarCore:
             return 0, 1, f"VETO ESPAÇO RIGIDO: Venda de Fundo Bloqueada (bb_pos={bb_pos:.2f})."
         
         ml_pts = 0.0
-        if ml_prob >= 80.0: ml_pts = 4.0
-        elif ml_prob >= 70.0: ml_pts = 3.0
-        elif ml_prob >= 60.0: ml_pts = 2.0
-        elif ml_prob >= 55.0: ml_pts = 1.0 # OTIMIZAÇÃO: Tolerância aumentada
+        if ml_prob >= 90.0: ml_pts = 4.0
+        elif ml_prob >= 85.0: ml_pts = 3.0
+        elif ml_prob >= 75.0: ml_pts = 2.0
+        elif ml_prob >= 65.0: ml_pts = 1.0 # OTIMIZAÇÃO: Tolerância aumentada
         else: return 0, 1, f"VETO ML: Probabilidade Baixa ({ml_prob:.1f}%)."
         
         expected_move_pct = (current_atr * 2.0 / raw_price) * 100.0
         espaco_pts = 0.0
-        if expected_move_pct >= 1.5: espaco_pts = 3.0
-        elif expected_move_pct >= 0.8: espaco_pts = 2.0
-        elif expected_move_pct >= 0.4: espaco_pts = 1.0 # OTIMIZAÇÃO: Alvos mais curtos aceitos
+        if expected_move_pct >= 1.5: espaco_pts = 4.0
+        elif expected_move_pct >= 0.8: espaco_pts = 3.0
+        elif expected_move_pct >= 0.4: espaco_pts = 2.0 # OTIMIZAÇÃO: Alvos mais curtos aceitos
         else: return 0, 1, f"VETO ESPAÇO: Alvo muito curto ({expected_move_pct:.2f}%)."
         
         liq_pts = 0.0
         apoios = []
         
         # OTIMIZAÇÃO: Limiares do VWAP relaxados de 50.5 para 50.2
-        if direction == 'BUY' and vwap_dict.get('Binance', 50) >= 50.2: 
+        if direction == 'BUY' and vwap_dict.get('Binance', 50) >= 50.5: 
             liq_pts += 1.0
             apoios.append('Binance_VWAP')
         elif direction == 'SELL' and vwap_dict.get('Binance', 50) <= 49.8: 
             liq_pts += 1.0
             apoios.append('Binance_VWAP')
 
-        if direction == 'BUY' and vwap_dict.get('Bybit', 50) >= 50.2: 
+        if direction == 'BUY' and vwap_dict.get('Bybit', 50) >= 50.5: 
             liq_pts += 1.0
             apoios.append('Bybit_VWAP')
         elif direction == 'SELL' and vwap_dict.get('Bybit', 50) <= 49.8: 
@@ -457,7 +457,7 @@ class RadarCore:
             apoios.append('Bybit_VWAP')
 
         # OTIMIZAÇÃO: Limiares do CVD relaxados para 50.2
-        cvd_buy = cvd_dict.get('Binance', 50.0) >= 50.2 or cvd_dict.get('Bybit', 50.0) >= 50.2
+        cvd_buy = cvd_dict.get('Binance', 50.0) >= 50.2 or cvd_dict.get('Bybit', 50.0) >= 50.5
         cvd_sell = cvd_dict.get('Binance', 50.0) <= 49.8 or cvd_dict.get('Bybit', 50.0) <= 49.8
         if direction == 'BUY' and cvd_buy: 
             liq_pts += 1.0
@@ -478,7 +478,7 @@ class RadarCore:
         motivo_detalhado = f"ML_Dir:{ml_pts:.1f} | ML_Espaço:{espaco_pts:.1f}({expected_move_pct:.1f}%) | Fluxo:{liq_pts:.1f}({detalhes})"
         
         # OTIMIZAÇÃO: Corte Final flexibilizado para 7.0
-        return total, (2 if total >= 7.0 else 1), motivo_detalhado
+        return total, (2 if total >= 7.5 else 1), motivo_detalhado
 
     async def scan_market(self):
         ativos = Config.get_ativos()
