@@ -8,7 +8,6 @@ import pandas as pd
 import numpy as np
 import quantstats as qs
 from config import Config
-from executor import EngineExecutor, TelegramLogger
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
