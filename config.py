@@ -38,7 +38,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
                     spread_pct = ((ask - bid) / bid) * 100
 
                     # 3. Volume mínimo de 55 milhões de dólares nas últimas 24h (Liquidez Extrema)
-                    if spread_pct <= 0.05 and volume_24h >= 25000000:
+                    if spread_pct <= 0.05 and volume_24h >= 40000000:
                         moedas_validas.append((symbol, volume_24h))
 
         moedas_validas.sort(key=lambda x: x[1], reverse=True)
@@ -59,7 +59,7 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    MIN_SCORE_ENTRY: float = 6.5
+    MIN_SCORE_ENTRY: float = 7.5
     OPERA_CONTA_REAL: bool = False
 
     # ---------------------------------------------------------
@@ -78,20 +78,20 @@ class Config:
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
 
-    MAX_OPEN_TRADES: int = 10
+    MAX_OPEN_TRADES: int = 5
     ALAVANCAGEM: int = 35
 
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (FÔLEGO PARA 35X)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 2
+    BARRIER_HORIZON: int = 3
     BARRIER_TP_PCT: float = 1.040               # Alvo triplo base: 4% na moeda
     BARRIER_SL_PCT: float = 0.970               # Stop triplo base: 3% na moeda
     
     CORRELATION_THRESHOLD: float = 0.70
     MAX_TRADE_DURATION_MINUTES: int = 240
 
-    NUM_MOEDAS_OPERACIONAIS: int = 2000
+    NUM_MOEDAS_OPERACIONAIS: int = 5000
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5
     TIMEFRAME: str = '15m'
