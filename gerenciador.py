@@ -26,7 +26,7 @@ class GerenciadorRiscoAutonomo:
         
         # 🧠 RASTREADOR INTERNO DE MARGEM E LUCRO ACUMULADO
         self.margens_ativas = {}
-        self.pnl_realizado_acumulado = 0.0  # Guarda o lucro/prejuízo das cestas já fechadas nesta sessão
+        self.pnl_realizado_acumulado = 0.0
 
     def calcular_topologia_trade_avancada(self, signal: dict) -> dict:
         score = float(signal.get('score', 5.0))
@@ -192,20 +192,24 @@ class GerenciadorRiscoAutonomo:
         current_roe = total_net_pnl / total_margin
         max_roe = self.max_basket_pnl / total_margin
 
+        # Stop Global Inicial: -70% do capital exposto
         stop_dinamico_usd = -total_margin * 0.70  
         fase_catraca = "INATIVA"
         
-        if max_roe >= 0.50:
+        # ⚙️ CATRACA RECALIBRADA (Com mais fôlego para Cripto)
+        if max_roe >= 0.70:
+            # Fase 3: Operação decolou muito. Trailing stop colado a 20% do topo.
             stop_dinamico_usd = (max_roe - 0.20) * total_margin
             fase_catraca = "ASFIXIA CONTÍNUA (Fase 3)"
-        elif max_roe >= 0.25:
-            stop_dinamico_usd = total_margin * 0.10
+        elif max_roe >= 0.45:
+            # Fase 2: Ao atingir 45% de lucro, garante 15% de margem no bolso.
+            stop_dinamico_usd = total_margin * 0.15
             fase_catraca = "FIXAÇÃO (Fase 2)"
-        elif max_roe >= 0.10:
-            stop_dinamico_usd = 0.0
-            fase_catraca = "BREAK-EVEN (Fase 1)"
+        elif max_roe >= 0.25:
+            # Fase 1: Ao atingir 25%, garante 2% de lucro apenas para pagar as taxas da corretora.
+            stop_dinamico_usd = total_margin * 0.02
+            fase_catraca = "BREAK-EVEN SEGURO (Fase 1)"
 
-        # Calcula o saldo real somando a base com os lucros já fechados e o flutuante atual
         saldo_base_sessao = banca_inicial + self.pnl_realizado_acumulado
         saldo_atual_estimado = saldo_base_sessao + total_net_pnl
 
@@ -241,7 +245,6 @@ class GerenciadorRiscoAutonomo:
             ]
             await asyncio.gather(*close_tasks, return_exceptions=True)
 
-            # Grava o PnL fechado na memória para a próxima cesta
             self.pnl_realizado_acumulado += total_net_pnl
             saldo_final_ciclo = banca_inicial + self.pnl_realizado_acumulado
             
@@ -276,3 +279,4 @@ if __name__ == "__main__":
         asyncio.run(gerenciador.loop_agente_autonomo())
     except KeyboardInterrupt:
         logging.info("🛑 Gerenciador autônomo desligado pelo operador.")
+            
