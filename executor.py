@@ -58,7 +58,7 @@ class GerenciadorRiscoAutonomo:
         limite_proporcional = saldo_banca * 0.05 # Nunca aloca mais de 5% da banca em uma única ordem
         max_usd_permitido = min(max_usd_absoluto, limite_proporcional)
         
-        kelly_fraction = 0.25 
+        kelly_fraction = 0.45
         base_invest = min_usd + (conviction ** 1.5) * (max_usd_permitido - min_usd)
         invest_amount = float(np.clip(base_invest * kelly_fraction, min_usd, max_usd_permitido))
         
