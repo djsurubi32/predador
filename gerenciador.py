@@ -47,7 +47,7 @@ class GerenciadorRiscoAutonomo:
         min_usd = 0.50
         max_usd = 10.00 
         
-        kelly_fraction = 0.25 
+        kelly_fraction = 0.45 
         base_invest = min_usd + (conviction ** 1.5) * (max_usd - min_usd)
         invest_amount = float(np.clip(base_invest * kelly_fraction, min_usd, max_usd))
 
