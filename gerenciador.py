@@ -20,11 +20,10 @@ class GerenciadorRiscoAutonomo:
     def __init__(self):
         self.executor = EngineExecutor()
         self.db = self.executor.db
-        
+
         # Estado interno por símbolo
-        # Guarda: entry_price, original_sl, risk_distance, current_sl, current_tp, side, qty, be_ativado
         self.posicoes_monitoradas = {}
-        
+
         self.last_summary_time = time.time()
         self.pnl_realizado_acumulado = 0.0
 
@@ -48,10 +47,98 @@ class GerenciadorRiscoAutonomo:
             "be_price": be_price
         }
 
+    async def executar_novas_entradas(self):
+        """
+        [NOVO MÓDULO] Lê a Mesa do Leilão (sinais do Analisador) e executa as
+        ordens obedecendo o gerenciamento de risco e tamanho de posição.
+        """
+        try:
+            sinais = await self.db.get_elite_signals()
+            if not sinais:
+                return
+
+            # 1. Trava de Segurança Global (Max Trades)
+            positions = await self.executor.execution.get_current_positions(self.db)
+            max_trades = getattr(Config, 'MAX_OPEN_TRADES', 5)
+            if len(positions) >= max_trades:
+                return
+
+            simbolos_abertos = [p.get('symbol') for p in positions]
+
+            for sinal in sinais:
+                symbol = sinal['symbol']
+                direction = sinal['direction']
+                entry = sinal['price']
+                atr = sinal.get('current_atr', entry * 0.01)
+
+                # Impede abrir duas ordens na mesma moeda
+                if symbol in simbolos_abertos:
+                    continue
+
+                # Verifica Cooldown (impede entrar na mesma moeda após tomar Stop)
+                cooldown = await self.db.get_cooldown(symbol)
+                if time.time() < cooldown:
+                    continue
+
+                # 2. Cálculo do Stop Loss Institucional (Baseado na Volatilidade/ATR)
+                if direction in ['BUY', 'LONG']:
+                    sl = entry - (atr * 1.5) # Stop fica a 1.5x a volatilidade da moeda
+                else:
+                    sl = entry + (atr * 1.5)
+
+                alvos = self._calcular_risco_e_alvos(entry, sl, direction)
+                tp = alvos['tp']
+
+                # 3. Position Sizing Matemático (Risco em Dólares)
+                # Define o risco máximo fixo por trade (Padrão: $5 dólares se não existir no Config)
+                risco_usd = getattr(Config, 'RISCO_POR_TRADE_USD', 5.0)
+
+                risk_distance_price = abs(entry - sl)
+                if risk_distance_price == 0:
+                    continue
+
+                # Fórmula Clássica de Lote: Qty = Risco Financeiro / Distância do Stop
+                qty = risco_usd / risk_distance_price
+
+                # 4. Empacota a ordem para o Roteador do Executor
+                order_packet = {
+                    'symbol': symbol,
+                    'direction': direction,
+                    'qty': qty,
+                    'current_price': entry,
+                    'tp': tp,
+                    'sl': sl
+                }
+
+                logging.info(f"⚡ ORDEM DE DISPARO: {symbol} | {direction} | Qty: {qty:.4f} | Risco: ${risco_usd:.2f}")
+                sucesso = await self.executor.order_router_inbound(order_packet)
+
+                if sucesso:
+                    # Notifica no Telegram
+                    msg = (
+                        f"🎯 <b>NOVA POSIÇÃO ABERTA</b>\n"
+                        f"Moeda: {symbol}\n"
+                        f"Direção: {direction}\n"
+                        f"Entrada: {entry:.5f}\n"
+                        f"Take Profit (2R): {tp:.5f}\n"
+                        f"Stop Loss (ATR): {sl:.5f}\n"
+                        f"Score IA: {sinal.get('score', 0):.1f}/10"
+                    )
+                    await TelegramLogger.send(msg)
+
+                    simbolos_abertos.append(symbol)
+                    if len(simbolos_abertos) >= max_trades:
+                        break # Encheu o balde de ordens ativas
+
+            # Limpa a mesa de leilão após processar para evitar repetições
+            await self.db.clear_elite_signals()
+
+        except Exception as e:
+            logging.error(f"Erro no módulo de execução de novas entradas: {e}")
+
     async def sincronizar_posicoes_abertas(self):
         """
         Busca todas as posições abertas na corretora e sincroniza o estado interno.
-        Só gerencia o que já está aberto. Não abre nada.
         """
         try:
             positions = await self.executor.execution.get_current_positions(self.db)
@@ -75,11 +162,8 @@ class GerenciadorRiscoAutonomo:
             current_tp = float(p.get('takeProfit', p.get('tp', 0.0)))
             net_pnl = float(p.get('netPnl', 0.0))
 
-            # Se a posição ainda não está sendo monitorada, inicializa o estado 2:1
             if symbol not in self.posicoes_monitoradas:
-                # Caso a corretora não tenha SL definido, usamos um fallback conservador
                 if current_sl <= 0:
-                    # Fallback de 1.5% de risco se não houver SL
                     if side in ['BUY', 'LONG']:
                         current_sl = entry * 0.985
                     else:
@@ -101,7 +185,6 @@ class GerenciadorRiscoAutonomo:
                     "min_pnl": net_pnl
                 }
 
-                # Força o TP para 2R na corretora (se a API permitir)
                 try:
                     await self.executor.execution.modify_position_tp_sl(
                         symbol=symbol,
@@ -113,14 +196,12 @@ class GerenciadorRiscoAutonomo:
                     logging.warning(f"[{symbol}] Não foi possível modificar TP/SL na corretora: {e}")
 
             else:
-                # Atualiza extremos de PnL
                 mon = self.posicoes_monitoradas[symbol]
                 if net_pnl > mon["max_pnl"]:
                     mon["max_pnl"] = net_pnl
                 if net_pnl < mon["min_pnl"]:
                     mon["min_pnl"] = net_pnl
 
-        # Remove do monitoramento posições que já não existem mais
         symbols_para_remover = [s for s in self.posicoes_monitoradas if s not in symbols_ativos]
         for s in symbols_para_remover:
             del self.posicoes_monitoradas[s]
@@ -129,8 +210,6 @@ class GerenciadorRiscoAutonomo:
         """
         Lógica principal de gerenciamento 2:1 por posição individual.
         - Move SL para Break-Even + buffer quando atinge +1R
-        - Nunca fecha a cesta inteira
-        - Deixa o trade fluir até o 2R ou ser estopado no BE
         """
         if not self.posicoes_monitoradas:
             return
@@ -152,21 +231,17 @@ class GerenciadorRiscoAutonomo:
             entry = mon["entry"]
             risk = mon["risk_distance"]
             side = mon["side"]
-            qty = mon["qty"]
 
-            # Valor de 1R em dinheiro (aproximado)
-            # Usamos o notional / leverage implícito, mas o mais confiável é o PnL atual vs distância de preço
             current_price = float(p.get('markPrice', p.get('price', entry)))
-            
+
             if side in ['BUY', 'LONG']:
                 pnl_em_r = (current_price - entry) / risk if risk > 0 else 0.0
             else:
                 pnl_em_r = (entry - current_price) / risk if risk > 0 else 0.0
 
-            # === MOVE PARA BREAK-EVEN quando atinge +1R ===
             if not mon["be_ativado"] and pnl_em_r >= 1.0:
                 novo_sl = mon["be_price"]
-                
+
                 try:
                     await self.executor.execution.modify_position_tp_sl(
                         symbol=symbol,
@@ -175,7 +250,7 @@ class GerenciadorRiscoAutonomo:
                     )
                     mon["current_sl"] = novo_sl
                     mon["be_ativado"] = True
-                    
+
                     msg = (
                         f"🔒 [{symbol}] BREAK-EVEN ATIVADO (1R atingido)\n"
                         f"Side: {side} | Entry: {entry:.5f}\n"
@@ -185,7 +260,7 @@ class GerenciadorRiscoAutonomo:
                     )
                     await TelegramLogger.send(msg)
                     logging.info(f"[{symbol}] SL movido para Break-Even + buffer | Novo SL: {novo_sl:.5f}")
-                    
+
                 except Exception as e:
                     logging.error(f"[{symbol}] Falha ao mover SL para BE: {e}")
 
@@ -208,23 +283,17 @@ class GerenciadorRiscoAutonomo:
             return
 
         total_net_pnl = sum(float(p.get('netPnl', 0.0)) for p in positions)
-        total_margin_estimada = 0.0
 
         linhas = []
         for p in positions:
             symbol = p.get('symbol')
             net_pnl = float(p.get('netPnl', 0.0))
             mon = self.posicoes_monitoradas.get(symbol, {})
-            
+
             be_status = "BE ATIVO" if mon.get("be_ativado") else "SL Original"
             linhas.append(
                 f"• {symbol} | {mon.get('side', '?')} | PnL: ${net_pnl:+.2f} | {be_status}"
             )
-
-            # Estimativa grosseira de margem (só para relatório)
-            qty = float(p.get('contracts', p.get('amount', 0.0)))
-            price = float(p.get('entryPrice', 0.0))
-            total_margin_estimada += (qty * price) / 20.0   # assume \~20x média
 
         modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
         banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
@@ -241,17 +310,26 @@ class GerenciadorRiscoAutonomo:
         logging.info("Relatório periódico de posições enviado.")
 
     async def loop_agente_autonomo(self):
-        logging.info("🧠 GERENCIADOR DE RISCO 2:1 ONLINE — Apenas gerenciamento de posições abertas")
-        
+        logging.info("🧠 GERENCIADOR DE RISCO 2:1 ONLINE — Módulo de Abertura e Gestão Ativos")
+
         while True:
             try:
+                # 1. Lê a mesa de leilão e compra/vende
+                await self.executar_novas_entradas()
+
+                # 2. Atualiza a memória com o que foi executado
                 await self.sincronizar_posicoes_abertas()
+
+                # 3. Protege as posições ativas
                 await self.gerenciar_posicoes_2r()
+
+                # 4. Envia relatórios ao Telegram
                 await self.relatorio_periodico()
+
             except Exception as e:
                 logging.error(f"Erro crítico no loop do gerenciador: {e}")
             finally:
-                await asyncio.sleep(3)   # 3 segundos é suficiente e reduz carga
+                await asyncio.sleep(3)   # Intervalo suave
 
 if __name__ == "__main__":
     try:
