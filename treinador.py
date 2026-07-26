@@ -4,6 +4,7 @@ import logging
 import warnings
 import asyncio
 import joblib
+import gc
 from concurrent.futures import ThreadPoolExecutor
 
 import ccxt.async_support as ccxt_async
@@ -38,13 +39,13 @@ def apply_triple_barrier(df):
         entry, tp, sl = closes[i], closes[i] * tp_pct, closes[i] * sl_pct
         for j in range(1, horizon + 1):
             if highs[i + j] >= tp:
-                targets[i] = 1 # Rompimento Comprador (BUY)
+                targets[i] = 1
                 break
             elif lows[i + j] <= sl:
-                targets[i] = 2 # Rompimento Vendedor (SELL)
+                targets[i] = 2
                 break
         if np.isnan(targets[i]):
-            targets[i] = 0 # Indefinição / Tempo esgotado
+            targets[i] = 0
 
     df['target'] = targets
     return df
@@ -187,7 +188,6 @@ def prepare_features(df, btc_df=None):
     return df
 
 def cpu_bound_train(symbol, bars, btc_train_df):
-    """Função blindada contra concorrência e escalada para CPUs locais/VPS"""
     if len(bars) < 100:
         return f"⚠️ Dados insuficientes para {symbol}."
 
@@ -332,48 +332,42 @@ class MotorTreinamento:
         if not ativos: return []
 
         if time.time() - self.btc_train_time > 3600 or not self.btc_train_cache:
-            logging.info("Sincronizando benchmark temporal (BTC) em modo Assíncrono...")
+            logging.info("Sincronizando benchmark temporal (BTC) em modo Low-RAM...")
             self.btc_train_cache = await self.fetch_historical(ativos[0], Config.CANDLES_TREINAMENTO_ML)
             self.btc_train_time = time.time()
         return self.btc_train_cache
 
     async def iniciar_ciclo_treinamento(self):
         ativos = Config.get_ativos()
-        logging.info(f"🚀 Iniciando Forja Institucional Assíncrona (Lote de {len(ativos)} moedas)...")
+        logging.info(f"🚀 Iniciando Forja Institucional (Modo Low-RAM VPS) para {len(ativos)} moedas...")
 
         btc_data_raw = await self.get_btc_data()
         btc_train_df = pd.DataFrame(btc_data_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate']) if btc_data_raw else None
 
-        sem = asyncio.Semaphore(5)
-        async def fetch_with_sem(symbol):
-            async with sem:
-                return symbol, await self.fetch_historical(symbol, Config.CANDLES_TREINAMENTO_ML)
-
-        logging.info("📥 Baixando matrizes de histórico em paralelo...")
-        tasks = [fetch_with_sem(symbol) for symbol in ativos]
-        resultados_rede = await asyncio.gather(*tasks)
-
-        logging.info("🧠 Distribuindo treinamento para os núcleos de CPU (Via Threads Blindadas)...")
         loop = asyncio.get_running_loop()
 
-        # OTIMIZAÇÃO VITAL: ThreadPoolExecutor resolve o SegFault no Linux e isola o uso de RAM
-        max_threads = min(3, os.cpu_count() or 2)
-        with ThreadPoolExecutor(max_workers=max_threads) as pool:
-            cpu_tasks = []
-            for symbol, bars in resultados_rede:
+        # OTIMIZAÇÃO MAX-RAM: Treina 1 moeda por vez e limpa a memória imediatamente
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            for symbol in ativos:
+                logging.info(f"📥 Baixando histórico de {symbol}...")
+                bars = await self.fetch_historical(symbol, Config.CANDLES_TREINAMENTO_ML)
+
                 if not bars:
                     continue
-                cpu_tasks.append(
-                    loop.run_in_executor(pool, cpu_bound_train, symbol, bars, btc_train_df)
-                )
 
-            for f in asyncio.as_completed(cpu_tasks):
+                logging.info(f"🧠 Treinando modelo para {symbol}...")
                 try:
-                    resultado = await f
-                    if "⚠️" in resultado: logging.warning(resultado)
-                    else: logging.info(resultado)
+                    resultado = await loop.run_in_executor(pool, cpu_bound_train, symbol, bars, btc_train_df)
+                    if "⚠️" in resultado:
+                        logging.warning(resultado)
+                    else:
+                        logging.info(resultado)
                 except Exception as exc:
-                    logging.error(f"❌ Falha fatal processando worker: {exc}")
+                    logging.error(f"❌ Falha fatal processando {symbol}: {exc}")
+
+                # Destrói a matriz da memória e aciona o lixeiro do Python forçadamente
+                del bars
+                gc.collect()
 
         logging.info(f"💤 Treinamento blindado concluído. O motor vai hibernar por {Config.HORAS_RETREINO} horas.")
 
