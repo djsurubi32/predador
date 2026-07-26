@@ -20,8 +20,11 @@ def verificar_uso_ram():
 def run_treinador():
     """Microserviço 1: Forja de Inteligência Artificial (Heavy CPU)"""
     logging.info("🧠 Iniciando microserviço: TREINADOR (Machine Learning)")
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
-        treinador_main()
+        # CORREÇÃO: Agora o maestro sabe que o Treinador é um motor assíncrono
+        asyncio.run(treinador_main())
     except KeyboardInterrupt:
         pass
     except Exception as e:
