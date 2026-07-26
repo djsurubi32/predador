@@ -201,18 +201,6 @@ def cpu_bound_train(symbol, bars, btc_train_df):
 
     df['target'] = df['target'].astype(int)
 
-    classes_presentes = set(df['target'].unique())
-    classes_necessarias = {0, 1, 2}
-    classes_faltantes = classes_necessarias - classes_presentes
-    if classes_faltantes:
-        linhas_dummy = []
-        for c in classes_faltantes:
-            linha = df.iloc[-1:].copy()
-            linha['target'] = int(c)
-            linhas_dummy.append(linha)
-        df = pd.concat([df] + linhas_dummy, ignore_index=True)
-        df['target'] = df['target'].astype(int)
-
     hmm_model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42, min_covar=1e-3)
     try:
         with warnings.catch_warnings():
@@ -236,6 +224,13 @@ def cpu_bound_train(symbol, bars, btc_train_df):
     split_idx = int(len(X) * 0.8)
     X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+
+    # TRAVA DE SEGURANÇA MATEMÁTICA:
+    # Impede o crash do solver abortando o treino em moedas lateralizadas
+    if len(np.unique(y_train)) < 2:
+        return f"⚠️ Treino abortado para {symbol}: Base de treino sem contraste direcional (Apenas classe {np.unique(y_train)})."
+    if len(np.unique(y_val)) < 2:
+        return f"⚠️ Treino abortado para {symbol}: Base de validação sem contraste direcional (Apenas classe {np.unique(y_val)})."
 
     lgbm = lgb.LGBMClassifier(
         n_estimators=150, learning_rate=0.03, max_depth=6, num_leaves=31,
@@ -346,7 +341,6 @@ class MotorTreinamento:
 
         loop = asyncio.get_running_loop()
 
-        # OTIMIZAÇÃO MAX-RAM: Treina 1 moeda por vez e limpa a memória imediatamente
         with ThreadPoolExecutor(max_workers=1) as pool:
             for symbol in ativos:
                 logging.info(f"📥 Baixando histórico de {symbol}...")
@@ -365,7 +359,6 @@ class MotorTreinamento:
                 except Exception as exc:
                     logging.error(f"❌ Falha fatal processando {symbol}: {exc}")
 
-                # Destrói a matriz da memória e aciona o lixeiro do Python forçadamente
                 del bars
                 gc.collect()
 
