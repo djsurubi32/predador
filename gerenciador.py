@@ -111,7 +111,7 @@ class GerenciadorRiscoAutonomo:
 
                     simbolos_abertos.append(symbol)
                     if len(simbolos_abertos) >= max_trades:
-                        break
+                        break 
 
             await self.db.clear_elite_signals()
 
@@ -169,7 +169,8 @@ class GerenciadorRiscoAutonomo:
                     "qty": qty,
                     "be_ativado": be_status_inicial,
                     "max_pnl": net_pnl,
-                    "min_pnl": net_pnl
+                    "min_pnl": net_pnl,
+                    "last_net_pnl": net_pnl
                 }
 
                 try:
@@ -184,13 +185,18 @@ class GerenciadorRiscoAutonomo:
 
             else:
                 mon = self.posicoes_monitoradas[symbol]
+                mon["last_net_pnl"] = net_pnl
                 if net_pnl > mon["max_pnl"]:
                     mon["max_pnl"] = net_pnl
                 if net_pnl < mon["min_pnl"]:
                     mon["min_pnl"] = net_pnl
 
+        # Acumula o PnL final no saldo da banca quando a posição é fechada
         symbols_para_remover = [s for s in self.posicoes_monitoradas if s not in symbols_ativos]
         for s in symbols_para_remover:
+            pnl_fechamento = self.posicoes_monitoradas[s].get("last_net_pnl", 0.0)
+            self.pnl_realizado_acumulado += pnl_fechamento
+            logging.info(f"[{s}] Posição encerrada. PnL de ${pnl_fechamento:+.2f} transferido para o saldo da banca.")
             del self.posicoes_monitoradas[s]
 
     async def gerenciar_posicoes_2r(self):
@@ -217,14 +223,13 @@ class GerenciadorRiscoAutonomo:
             qty = mon["qty"]
 
             current_price = float(p.get('markPrice', p.get('price', entry)))
-
+            
             if side in ['BUY', 'LONG']:
                 pnl_em_r = (current_price - entry) / risk if risk > 0 else 0.0
             else:
                 pnl_em_r = (entry - current_price) / risk if risk > 0 else 0.0
 
             # --- CATRACA DE SOFTWARE (Hard Take Profit) ---
-            # Força a saída a mercado se atingir o alvo de lucro e a corretora não executar
             if pnl_em_r >= 1.98:
                 msg = (
                     f"🏆 <b>ALVO 2R ATINGIDO (VIA SOFTWARE)</b>\n"
@@ -234,9 +239,8 @@ class GerenciadorRiscoAutonomo:
                 )
                 await TelegramLogger.send(msg)
                 logging.info(f"[{symbol}] PnL atingiu {pnl_em_r:.2f}R. Forçando fechamento a mercado.")
-
+                
                 try:
-                    # Envia ordem a mercado oposta para fechar a posição
                     close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
                     await self.executor.execution.exchange.create_order(
                         symbol=symbol,
@@ -247,13 +251,13 @@ class GerenciadorRiscoAutonomo:
                     )
                 except Exception as e:
                     logging.error(f"[{symbol}] Falha ao fechar posição a mercado via software: {e}")
-
-                continue
+                    
+                continue 
 
             # --- GESTÃO DE BREAK-EVEN ---
             current_sl_corretora = float(p.get('stopLoss', p.get('sl', 0.0)))
             ja_no_be = False
-
+            
             if current_sl_corretora > 0:
                 if side in ['BUY', 'LONG'] and current_sl_corretora >= mon["be_price"] * 0.999:
                     ja_no_be = True
@@ -262,7 +266,7 @@ class GerenciadorRiscoAutonomo:
 
             if (not mon["be_ativado"] and not ja_no_be) and pnl_em_r >= 1.0:
                 novo_sl = mon["be_price"]
-
+                
                 try:
                     await self.executor.execution.modify_position_tp_sl(
                         symbol=symbol,
@@ -271,7 +275,7 @@ class GerenciadorRiscoAutonomo:
                     )
                     mon["current_sl"] = novo_sl
                     mon["be_ativado"] = True
-
+                    
                     msg = (
                         f"🔒 [{symbol}] BREAK-EVEN ATIVADO (1R atingido)\n"
                         f"Side: {side} | Entry: {entry:.5f}\n"
@@ -281,7 +285,7 @@ class GerenciadorRiscoAutonomo:
                     )
                     await TelegramLogger.send(msg)
                     logging.info(f"[{symbol}] SL movido para Break-Even + buffer | Novo SL: {novo_sl:.5f}")
-
+                    
                 except Exception as e:
                     logging.error(f"[{symbol}] Falha ao mover SL para BE: {e}")
 
@@ -301,13 +305,13 @@ class GerenciadorRiscoAutonomo:
             return
 
         total_net_pnl = sum(float(p.get('netPnl', 0.0)) for p in positions)
-
+        
         linhas = []
         for p in positions:
             symbol = p.get('symbol')
             net_pnl = float(p.get('netPnl', 0.0))
             mon = self.posicoes_monitoradas.get(symbol, {})
-
+            
             be_status = "BE ATIVO" if mon.get("be_ativado") else "SL Original"
             linhas.append(
                 f"• {symbol} | {mon.get('side', '?')} | PnL: ${net_pnl:+.2f} | {be_status}"
@@ -315,6 +319,8 @@ class GerenciadorRiscoAutonomo:
 
         modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
         banca_inicial = getattr(Config, 'BANCA_INICIAL', 100.0)
+        
+        # O Saldo Estimado agora sobe ou desce permanentemente com o PnL Realizado Acumulado
         saldo_estimado = banca_inicial + self.pnl_realizado_acumulado + total_net_pnl
 
         resumo = (
@@ -329,7 +335,7 @@ class GerenciadorRiscoAutonomo:
 
     async def loop_agente_autonomo(self):
         logging.info("🧠 GERENCIADOR DE RISCO 2:1 ONLINE — Módulo de Abertura e Gestão Ativos")
-
+        
         while True:
             try:
                 await self.executar_novas_entradas()
