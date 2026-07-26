@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sys
 import time
+import psutil
 
 # Importação dos nossos microserviços isolados
 from treinador import main as treinador_main
@@ -11,6 +12,10 @@ from gerenciador import GerenciadorRiscoAutonomo
 
 # Configuração do Orquestrador
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [MAESTRO] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+def verificar_uso_ram():
+    """Retorna o percentual de uso da memória RAM da VPS."""
+    return psutil.virtual_memory().percent
 
 def run_treinador():
     """Microserviço 1: Forja de Inteligência Artificial (Heavy CPU)"""
@@ -53,44 +58,64 @@ if __name__ == '__main__':
     logging.info("===============================================================")
     logging.info("🚀 SISTEMA PREDADOR QUANTITATIVO V2.0 (ARQUITETURA DISTRIBUÍDA)")
     logging.info("===============================================================")
-    
+
     # Criação dos processos independentes (Isolamento de Memória e CPU)
     p_treinador = multiprocessing.Process(target=run_treinador, name="Processo-Treinador")
     p_analisador = multiprocessing.Process(target=run_analisador, name="Processo-Analisador")
     p_gerenciador = multiprocessing.Process(target=run_gerenciador, name="Processo-Gerenciador")
 
-    # Ordem de ignição faseada (para não saturar a rede SQLite e as APIs no mesmo milissegundo)
-    p_treinador.start()
-    time.sleep(3)  # Dá 3 segundos para a IA aquecer
-    
+    # Ordem de ignição faseada para suportar picos de memória da VPS
+    logging.info("⏳ Ligando Analisador primeiro para absorver o pico de RAM da IA de NLP...")
     p_analisador.start()
-    time.sleep(3)  # Dá 3 segundos para o Radar estabilizar as conexões WebSocket/REST
-    
+    time.sleep(20)  # Dá 20 segundos para a IA estabilizar na memória
+
     p_gerenciador.start()
+    time.sleep(5)  # Estabilização rápida
+
+    uso_ram = verificar_uso_ram()
+    if uso_ram < 85.0:
+        logging.info(f"📊 RAM estável ({uso_ram}%). Iniciando Treinador...")
+        p_treinador.start()
+    else:
+        logging.warning(f"⚠️ RAM crítica na VPS ({uso_ram}%). O Treinador aguardará alívio para iniciar.")
 
     try:
-        # O Maestro fica num loop suave apenas a monitorizar a saúde dos seus 3 filhos
+        # O Maestro atua como cão de guarda, reiniciando automaticamente processos mortos
         while True:
-            if not p_treinador.is_alive():
-                logging.warning("⚠️ Alerta: O processo TREINADOR parou inesperadamente.")
+            time.sleep(30)
+
             if not p_analisador.is_alive():
-                logging.warning("⚠️ Alerta: O processo ANALISADOR parou inesperadamente.")
+                logging.warning("⚠️ Alerta: O processo ANALISADOR caiu. Reiniciando de forma autônoma...")
+                p_analisador = multiprocessing.Process(target=run_analisador, name="Processo-Analisador")
+                p_analisador.start()
+                time.sleep(20)
+
             if not p_gerenciador.is_alive():
-                logging.warning("⚠️ Alerta: O processo GERENCIADOR parou inesperadamente.")
-            
-            # Hiberna por 60 segundos antes de fazer novo check-up
-            time.sleep(60)
-            
+                logging.warning("⚠️ Alerta: O processo GERENCIADOR caiu. Reiniciando de forma autônoma...")
+                p_gerenciador = multiprocessing.Process(target=run_gerenciador, name="Processo-Gerenciador")
+                p_gerenciador.start()
+                time.sleep(5)
+
+            if not p_treinador.is_alive():
+                uso_ram = verificar_uso_ram()
+                if uso_ram < 85.0:
+                    logging.warning(f"⚠️ O processo TREINADOR caiu ou estava na fila. RAM em {uso_ram}%. (Re)iniciando...")
+                    p_treinador = multiprocessing.Process(target=run_treinador, name="Processo-Treinador")
+                    p_treinador.start()
+                else:
+                    logging.warning(f"⚠️ TREINADOR inativo. Aguardando alívio de RAM (Atual: {uso_ram}%) para não travar a VPS.")
+
     except KeyboardInterrupt:
         # Morte Limpa (Graceful Shutdown) caso prima Ctrl+C no terminal
         logging.info("🛑 Comando de paragem recebido. A desligar todos os motores de forma segura...")
-        p_treinador.terminate()
-        p_analisador.terminate()
-        p_gerenciador.terminate()
-        
+
+        if p_treinador.is_alive(): p_treinador.terminate()
+        if p_analisador.is_alive(): p_analisador.terminate()
+        if p_gerenciador.is_alive(): p_gerenciador.terminate()
+
         p_treinador.join()
         p_analisador.join()
         p_gerenciador.join()
-        
+
         logging.info("✅ Sistema integralmente encerrado.")
         sys.exit(0)
