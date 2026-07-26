@@ -76,7 +76,7 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (FÔLEGO PARA 35X)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 1
+    BARRIER_HORIZON: int = 2
     BARRIER_TP_PCT: float = 1.040               # Alvo triplo base: 4% na moeda
     BARRIER_SL_PCT: float = 0.970               # Stop triplo base: 3% na moeda
 
@@ -87,7 +87,7 @@ class Config:
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5
     TIMEFRAME: str = '15m'
-    CANDLES_TREINAMENTO_ML: int = 100000
+    CANDLES_TREINAMENTO_ML: int = 50000
     HORAS_RETREINO: int = 10
     NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
