@@ -20,22 +20,22 @@ class GerenciadorRiscoAutonomo:
     def __init__(self):
         self.executor = EngineExecutor()
         self.db = self.executor.db
-        
+
         # Estado interno por símbolo
         self.posicoes_monitoradas = {}
-        
+
         self.last_summary_time = time.time()
         self.pnl_realizado_acumulado = 0.0
 
     def _calcular_risco_e_alvos(self, entry: float, sl: float, side: str) -> dict:
         if side.upper() in ['BUY', 'LONG']:
             risk_distance = abs(entry - sl)
-            tp = entry + (risk_distance * 2.0)
-            be_price = entry + (risk_distance * 0.05)
+            tp = entry + (risk_distance * 2.0)          # 2R
+            be_price = entry + (risk_distance * 0.05)   # BE + 5% do risco (cobre taxas)
         else:
             risk_distance = abs(sl - entry)
-            tp = entry - (risk_distance * 2.0)
-            be_price = entry - (risk_distance * 0.05)
+            tp = entry - (risk_distance * 2.0)          # 2R
+            be_price = entry - (risk_distance * 0.05)   # BE + 5% do risco
 
         return {
             "risk_distance": risk_distance,
@@ -61,7 +61,7 @@ class GerenciadorRiscoAutonomo:
                 direction = sinal['direction']
                 entry = sinal['price']
                 atr = sinal.get('current_atr', entry * 0.01)
-                
+
                 if symbol in simbolos_abertos:
                     continue
 
@@ -77,12 +77,12 @@ class GerenciadorRiscoAutonomo:
                 alvos = self._calcular_risco_e_alvos(entry, sl, direction)
                 tp = alvos['tp']
 
-                risco_usd = getattr(Config, 'RISCO_POR_TRADE_USD', 5.0) 
-                
+                risco_usd = getattr(Config, 'RISCO_POR_TRADE_USD', 5.0)
+
                 risk_distance_price = abs(entry - sl)
                 if risk_distance_price == 0:
                     continue
-                
+
                 qty = risco_usd / risk_distance_price
 
                 order_packet = {
@@ -96,7 +96,7 @@ class GerenciadorRiscoAutonomo:
 
                 logging.info(f"⚡ ORDEM DE DISPARO: {symbol} | {direction} | Qty: {qty:.4f} | Risco: ${risco_usd:.2f}")
                 sucesso = await self.executor.order_router_inbound(order_packet)
-                
+
                 if sucesso:
                     msg = (
                         f"🎯 <b>NOVA POSIÇÃO ABERTA</b>\n"
@@ -108,10 +108,10 @@ class GerenciadorRiscoAutonomo:
                         f"Score IA: {sinal.get('score', 0):.1f}/10"
                     )
                     await TelegramLogger.send(msg)
-                    
+
                     simbolos_abertos.append(symbol)
                     if len(simbolos_abertos) >= max_trades:
-                        break 
+                        break
 
             await self.db.clear_elite_signals()
 
@@ -167,7 +167,7 @@ class GerenciadorRiscoAutonomo:
                     "be_price": alvos["be_price"],
                     "side": side,
                     "qty": qty,
-                    "be_ativado": be_status_inicial, # Previne o spam após restarts ou desconexões
+                    "be_ativado": be_status_inicial,
                     "max_pnl": net_pnl,
                     "min_pnl": net_pnl
                 }
@@ -217,14 +217,14 @@ class GerenciadorRiscoAutonomo:
             qty = mon["qty"]
 
             current_price = float(p.get('markPrice', p.get('price', entry)))
-            
+
             if side in ['BUY', 'LONG']:
                 pnl_em_r = (current_price - entry) / risk if risk > 0 else 0.0
             else:
                 pnl_em_r = (entry - current_price) / risk if risk > 0 else 0.0
 
-            # 1. CATRACA DE SOFTWARE (Hard Take Profit)
-            # Fecha a posição a mercado se a corretora falhar no TP limite
+            # --- CATRACA DE SOFTWARE (Hard Take Profit) ---
+            # Força a saída a mercado se atingir o alvo de lucro e a corretora não executar
             if pnl_em_r >= 1.98:
                 msg = (
                     f"🏆 <b>ALVO 2R ATINGIDO (VIA SOFTWARE)</b>\n"
@@ -234,13 +234,26 @@ class GerenciadorRiscoAutonomo:
                 )
                 await TelegramLogger.send(msg)
                 logging.info(f"[{symbol}] PnL atingiu {pnl_em_r:.2f}R. Forçando fechamento a mercado.")
-                await self.executor.force_close_position(symbol, side, qty, "TAKE_PROFIT_SOFTWARE", net_pnl)
-                continue # Vai para a próxima moeda
 
-            # 2. BREAK-EVEN (Com dupla checagem para evitar spam)
+                try:
+                    # Envia ordem a mercado oposta para fechar a posição
+                    close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
+                    await self.executor.execution.exchange.create_order(
+                        symbol=symbol,
+                        type='market',
+                        side=close_side,
+                        amount=qty,
+                        params={'reduceOnly': True}
+                    )
+                except Exception as e:
+                    logging.error(f"[{symbol}] Falha ao fechar posição a mercado via software: {e}")
+
+                continue
+
+            # --- GESTÃO DE BREAK-EVEN ---
             current_sl_corretora = float(p.get('stopLoss', p.get('sl', 0.0)))
             ja_no_be = False
-            
+
             if current_sl_corretora > 0:
                 if side in ['BUY', 'LONG'] and current_sl_corretora >= mon["be_price"] * 0.999:
                     ja_no_be = True
@@ -249,7 +262,7 @@ class GerenciadorRiscoAutonomo:
 
             if (not mon["be_ativado"] and not ja_no_be) and pnl_em_r >= 1.0:
                 novo_sl = mon["be_price"]
-                
+
                 try:
                     await self.executor.execution.modify_position_tp_sl(
                         symbol=symbol,
@@ -258,7 +271,7 @@ class GerenciadorRiscoAutonomo:
                     )
                     mon["current_sl"] = novo_sl
                     mon["be_ativado"] = True
-                    
+
                     msg = (
                         f"🔒 [{symbol}] BREAK-EVEN ATIVADO (1R atingido)\n"
                         f"Side: {side} | Entry: {entry:.5f}\n"
@@ -268,7 +281,7 @@ class GerenciadorRiscoAutonomo:
                     )
                     await TelegramLogger.send(msg)
                     logging.info(f"[{symbol}] SL movido para Break-Even + buffer | Novo SL: {novo_sl:.5f}")
-                    
+
                 except Exception as e:
                     logging.error(f"[{symbol}] Falha ao mover SL para BE: {e}")
 
@@ -288,13 +301,13 @@ class GerenciadorRiscoAutonomo:
             return
 
         total_net_pnl = sum(float(p.get('netPnl', 0.0)) for p in positions)
-        
+
         linhas = []
         for p in positions:
             symbol = p.get('symbol')
             net_pnl = float(p.get('netPnl', 0.0))
             mon = self.posicoes_monitoradas.get(symbol, {})
-            
+
             be_status = "BE ATIVO" if mon.get("be_ativado") else "SL Original"
             linhas.append(
                 f"• {symbol} | {mon.get('side', '?')} | PnL: ${net_pnl:+.2f} | {be_status}"
@@ -316,7 +329,7 @@ class GerenciadorRiscoAutonomo:
 
     async def loop_agente_autonomo(self):
         logging.info("🧠 GERENCIADOR DE RISCO 2:1 ONLINE — Módulo de Abertura e Gestão Ativos")
-        
+
         while True:
             try:
                 await self.executar_novas_entradas()
@@ -334,4 +347,3 @@ if __name__ == "__main__":
         asyncio.run(gerenciador.loop_agente_autonomo())
     except KeyboardInterrupt:
         logging.info("🛑 Gerenciador de risco 2:1 desligado pelo operador.")
-            
