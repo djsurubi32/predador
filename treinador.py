@@ -30,22 +30,52 @@ class DummyHMM:
     def predict(self, X):
         return np.zeros(len(X))
 
-def apply_triple_barrier(df):
-    horizon, tp_pct, sl_pct = Config.BARRIER_HORIZON, Config.BARRIER_TP_PCT, Config.BARRIER_SL_PCT
-    targets = np.full(len(df), np.nan)
-    closes, highs, lows = df['close'].values, df['high'].values, df['low'].values
+def apply_triple_barrier(df, tp_atr_mult=1.5, sl_atr_mult=1.0):
+    """
+    Barreira Tripla Dinâmica baseada em ATR.
+    Adapta os alvos à volatilidade de cada ativo individualmente para garantir
+    captura de movimentos dentro de um horizonte super curto (ex: 2 candles).
+    """
+    # Força a leitura de 2 candles conforme seu requisito operacional
+    horizon = getattr(Config, 'BARRIER_HORIZON', 2)
 
+    targets = np.full(len(df), np.nan)
+    closes = df['close'].values
+    highs = df['high'].values
+    lows = df['low'].values
+
+    # 1. Cálculo robusto do True Range (TR) e ATR (Average True Range)
+    if 'ATRr_14' in df.columns:
+        atr = df['ATRr_14'].bfill().values
+    else:
+        closes_shifted = np.roll(closes, 1)
+        closes_shifted[0] = closes[0]
+
+        tr = np.maximum(highs - lows,
+             np.maximum(abs(highs - closes_shifted),
+                        abs(lows - closes_shifted)))
+
+        atr = pd.Series(tr).rolling(window=14).mean().bfill().values
+
+    # 2. Avaliação dos alvos no tempo (Horizonte de 2 candles)
     for i in range(len(df) - horizon):
-        entry, tp, sl = closes[i], closes[i] * tp_pct, closes[i] * sl_pct
+        entry = closes[i]
+        current_atr = atr[i]
+
+        # Criação das fronteiras dinâmicas matemáticas baseadas na volatilidade atual
+        tp = entry + (current_atr * tp_atr_mult)
+        sl = entry - (current_atr * sl_atr_mult)
+
         for j in range(1, horizon + 1):
             if highs[i + j] >= tp:
-                targets[i] = 1
+                targets[i] = 1  # Classe 1: Atingiu Take Profit
                 break
             elif lows[i + j] <= sl:
-                targets[i] = 2
+                targets[i] = 2  # Classe 2: Atingiu Stop Loss
                 break
+
         if np.isnan(targets[i]):
-            targets[i] = 0
+            targets[i] = 0  # Classe 0: Lateralizou / O tempo acabou sem bater nos alvos
 
     df['target'] = targets
     return df
