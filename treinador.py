@@ -4,7 +4,7 @@ import logging
 import warnings
 import asyncio
 import joblib
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 import ccxt.async_support as ccxt_async
 import pandas as pd
@@ -187,7 +187,7 @@ def prepare_features(df, btc_df=None):
     return df
 
 def cpu_bound_train(symbol, bars, btc_train_df):
-    """Função isolada para processamento paralelo de CPU (Treinamento ML)"""
+    """Função blindada contra concorrência e escalada para CPUs locais/VPS"""
     if len(bars) < 100:
         return f"⚠️ Dados insuficientes para {symbol}."
 
@@ -258,7 +258,6 @@ def cpu_bound_train(symbol, bars, btc_train_df):
     xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
 
-    # 🚀 OTIMIZAÇÃO: Correção do Data Leakage no Meta-Learner (Usar apenas previsões de Validação)
     X_meta_val = np.column_stack([
         np.asarray(lgbm.predict_proba(X_val)),
         np.asarray(xgb_model.predict_proba(X_val)),
@@ -290,7 +289,6 @@ class MotorTreinamento:
         self.btc_train_time = 0
 
     async def fetch_historical(self, symbol, limit):
-        """Otimização: Extração puramente assíncrona com paginação veloz"""
         try:
             all_ohlcv = []
             since_ms = int((time.time() - (limit * 15 * 60)) * 1000)
@@ -346,7 +344,6 @@ class MotorTreinamento:
         btc_data_raw = await self.get_btc_data()
         btc_train_df = pd.DataFrame(btc_data_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate']) if btc_data_raw else None
 
-        # Coleta os dados de todas as moedas simultaneamente usando rede assíncrona
         sem = asyncio.Semaphore(5)
         async def fetch_with_sem(symbol):
             async with sem:
@@ -356,11 +353,12 @@ class MotorTreinamento:
         tasks = [fetch_with_sem(symbol) for symbol in ativos]
         resultados_rede = await asyncio.gather(*tasks)
 
-        # Envia os dados pesados para treinamento na CPU (Multi-core)
-        logging.info("🧠 Distribuindo treinamento para os núcleos de CPU...")
+        logging.info("🧠 Distribuindo treinamento para os núcleos de CPU (Via Threads Blindadas)...")
         loop = asyncio.get_running_loop()
 
-        with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as pool:
+        # OTIMIZAÇÃO VITAL: ThreadPoolExecutor resolve o SegFault no Linux e isola o uso de RAM
+        max_threads = min(3, os.cpu_count() or 2)
+        with ThreadPoolExecutor(max_workers=max_threads) as pool:
             cpu_tasks = []
             for symbol, bars in resultados_rede:
                 if not bars:
