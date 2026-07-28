@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-def obter_melhores_moedas(limite: int = 30) -> List[str]:
+def obter_melhores_moedas(limite: int = 50) -> List[str]:
     logger.info(f"🔄 Conectando à Bybit para buscar o Top {limite} de criptomoedas blindadas e líquidas...")
     try:
         exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
@@ -38,7 +38,7 @@ def obter_melhores_moedas(limite: int = 30) -> List[str]:
                     spread_pct = ((ask - bid) / bid) * 100
 
                     # 3. Volume mínimo de 55 milhões de dólares nas últimas 24h (Liquidez Extrema)
-                    if spread_pct <= 0.05 and volume_24h >= 1000000:
+                    if spread_pct <= 0.05 and volume_24h >= 4000000:
                         moedas_validas.append((symbol, volume_24h))
 
         moedas_validas.sort(key=lambda x: x[1], reverse=True)
@@ -76,7 +76,7 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (FÔLEGO PARA 35X)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 36
+    BARRIER_HORIZON: int = 4
     BARRIER_TP_PCT: float = 1.020               # Alvo triplo base: 4% na moeda
     BARRIER_SL_PCT: float = 0.980               # Stop triplo base: 3% na moeda
 
@@ -87,7 +87,7 @@ class Config:
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 15
     TIMEFRAME: str = '15m'
-    CANDLES_TREINAMENTO_ML: int = 5000
+    CANDLES_TREINAMENTO_ML: int = 7500
     HORAS_RETREINO: int = 24
     NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
