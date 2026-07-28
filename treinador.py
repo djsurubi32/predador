@@ -30,21 +30,18 @@ class DummyHMM:
     def predict(self, X):
         return np.zeros(len(X))
 
-def apply_triple_barrier(df, tp_atr_mult=1.5, sl_atr_mult=1.0):
+def apply_triple_barrier(df, tp_atr_mult=3.0, sl_atr_mult=2.0):
     """
     Barreira Tripla Dinâmica baseada em ATR.
-    Adapta os alvos à volatilidade de cada ativo individualmente para garantir
-    captura de movimentos dentro de um horizonte super curto (ex: 2 candles).
+    Multiplicadores ajustados para um horizonte preditivo mais longo (ex: 32 candles).
     """
-    # Força a leitura de 2 candles conforme seu requisito operacional
-    horizon = getattr(Config, 'BARRIER_HORIZON', 2)
+    horizon = getattr(Config, 'BARRIER_HORIZON', 32)
 
     targets = np.full(len(df), np.nan)
     closes = df['close'].values
     highs = df['high'].values
     lows = df['low'].values
 
-    # 1. Cálculo robusto do True Range (TR) e ATR (Average True Range)
     if 'ATRr_14' in df.columns:
         atr = df['ATRr_14'].bfill().values
     else:
@@ -57,25 +54,23 @@ def apply_triple_barrier(df, tp_atr_mult=1.5, sl_atr_mult=1.0):
 
         atr = pd.Series(tr).rolling(window=14).mean().bfill().values
 
-    # 2. Avaliação dos alvos no tempo (Horizonte de 2 candles)
     for i in range(len(df) - horizon):
         entry = closes[i]
         current_atr = atr[i]
 
-        # Criação das fronteiras dinâmicas matemáticas baseadas na volatilidade atual
         tp = entry + (current_atr * tp_atr_mult)
         sl = entry - (current_atr * sl_atr_mult)
 
         for j in range(1, horizon + 1):
             if highs[i + j] >= tp:
-                targets[i] = 1  # Classe 1: Atingiu Take Profit
+                targets[i] = 1  
                 break
             elif lows[i + j] <= sl:
-                targets[i] = 2  # Classe 2: Atingiu Stop Loss
+                targets[i] = 2  
                 break
 
         if np.isnan(targets[i]):
-            targets[i] = 0  # Classe 0: Lateralizou / O tempo acabou sem bater nos alvos
+            targets[i] = 0  
 
     df['target'] = targets
     return df
@@ -143,7 +138,16 @@ def prepare_features(df, btc_df=None):
     df['cvd_accel'] = df['cvd'].diff(3).diff(3).fillna(0.0)
 
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['vwap_dist'] = 0.0
+    
+    # VWAP sincronizado com o analisador
+    typical_price = (df['high'] + df['low'] + df['close']) / 3
+    df['vol_price'] = df['volume'] * typical_price
+    df['date_only'] = df['datetime'].dt.date
+    df['cum_vol_price'] = df.groupby('date_only')['vol_price'].cumsum()
+    df['cum_vol'] = df.groupby('date_only')['volume'].cumsum()
+    df['vwap'] = df['cum_vol_price'] / (df['cum_vol'] + 1e-9)
+    df['vwap_dist'] = ((df['close'] - df['vwap']) / (df['vwap'] + 1e-9)).fillna(0.0)
+
     df['liq_vacuum'] = ((df['high'] - df['low']) / (df['volume'] + 1e-9)).rolling(10).mean().fillna(0.0)
 
     if 'funding_rate' in df.columns:
@@ -162,7 +166,8 @@ def prepare_features(df, btc_df=None):
 
     roll50 = df['close'].rolling(50)
     df['z_score_50'] = ((df['close'] - roll50.mean()) / (roll50.std() + 1e-9)).fillna(0.0)
-    df['autocorr_3'] = df['log_return'].rolling(20).apply(lambda x: x.autocorr(lag=3) if len(x) > 3 else 0, raw=False).fillna(0.0)
+    
+    df['autocorr_3'] = df['log_return'].rolling(20).apply(lambda x: x.autocorr(lag=3) if len(x) >= 4 else 0, raw=False).fillna(0.0)
 
     n_period = 20
     high_max = df['high'].rolling(n_period).max()
@@ -181,7 +186,8 @@ def prepare_features(df, btc_df=None):
     ema9_macd = df['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
     df['macd_hist_vel'] = (df['MACD_12_26_9'] - ema9_macd).diff(2).fillna(0.0)
 
-    cols_to_drop = ['typical_price', 'vol_price', 'date_only', 'cum_vol_price', 'cum_vol', 'vwap', 'obv', 'obv_slope']
+    # Limpeza correta alinhada com o analisador
+    cols_to_drop = ['vol_price', 'date_only', 'cum_vol_price', 'cum_vol', 'vwap', 'obv', 'obv_slope']
     df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True, errors='ignore')
 
     df_indexed = df.set_index('datetime')
@@ -255,12 +261,10 @@ def cpu_bound_train(symbol, bars, btc_train_df):
     X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
 
-    # TRAVA DE SEGURANÇA MATEMÁTICA:
-    # Impede o crash do solver abortando o treino em moedas lateralizadas
     if len(np.unique(y_train)) < 2:
-        return f"⚠️ Treino abortado para {symbol}: Base de treino sem contraste direcional (Apenas classe {np.unique(y_train)})."
+        return f"⚠️ Treino abortado para {symbol}: Base de treino sem contraste direcional."
     if len(np.unique(y_val)) < 2:
-        return f"⚠️ Treino abortado para {symbol}: Base de validação sem contraste direcional (Apenas classe {np.unique(y_val)})."
+        return f"⚠️ Treino abortado para {symbol}: Base de validação sem contraste direcional."
 
     lgbm = lgb.LGBMClassifier(
         n_estimators=150, learning_rate=0.03, max_depth=6, num_leaves=31,
