@@ -76,7 +76,7 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (FÔLEGO PARA 35X)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 8
+    BARRIER_HORIZON: int = 36
     BARRIER_TP_PCT: float = 1.020               # Alvo triplo base: 4% na moeda
     BARRIER_SL_PCT: float = 0.980               # Stop triplo base: 3% na moeda
 
