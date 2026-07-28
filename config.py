@@ -59,7 +59,7 @@ class Config:
 
     MODELS_DIR: str = "modelos_ia"
 
-    MIN_SCORE_ENTRY: float = 6.0
+    MIN_SCORE_ENTRY: float = 5.2
     OPERA_CONTA_REAL: bool = False
 
     BANCA_DEMO_INICIAL: float = 100.0
@@ -73,7 +73,7 @@ class Config:
     # BARREIRAS DE TREINAMENTO ML (SCALPING DE TIRO CURTO)
     # ---------------------------------------------------------
     BARRIER_HORIZON: int = 2                    # Tempo máximo de espera na operação (2 velas)
-    BARRIER_TP_PCT: float = 1.005               # Alvo de lucro muito curto: 0.5% (Tiro rápido)
+    BARRIER_TP_PCT: float = 1.010           # Alvo de lucro muito curto: 0.5% (Tiro rápido)
     BARRIER_SL_PCT: float = 0.995               # Stop Loss muito curto: 0.5% (Corte rápido)
     TP_ATR_MULT: float = 1.0                    # Multiplicador ATR para Alvo (Caso o treinador exija)
     SL_ATR_MULT: float = 0.8                    # Multiplicador ATR para Stop (Caso o treinador exija)
