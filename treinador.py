@@ -14,7 +14,8 @@ from hmmlearn.hmm import GaussianHMM
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
-from sklearn.linear_model import LogisticRegression
+# Importando o novo Meta-Modelo (Random Forest)
+from sklearn.ensemble import RandomForestClassifier
 
 from config import Config
 from ta_indicators import add_custom_ta
@@ -30,12 +31,13 @@ class DummyHMM:
     def predict(self, X):
         return np.zeros(len(X))
 
-def apply_triple_barrier(df, tp_atr_mult=3.0, sl_atr_mult=2.0):
+def apply_triple_barrier(df):
     """
-    Barreira Tripla Dinâmica baseada em ATR.
-    Multiplicadores ajustados para um horizonte preditivo mais longo (ex: 32 candles).
+    Barreira Tripla Dinâmica baseada em ATR consumindo variáveis do config.py.
     """
-    horizon = getattr(Config, 'BARRIER_HORIZON', 32)
+    horizon = getattr(Config, 'BARRIER_HORIZON', 16)
+    tp_atr_mult = getattr(Config, 'TP_ATR_MULT', 2.0)
+    sl_atr_mult = getattr(Config, 'SL_ATR_MULT', 1.5)
 
     targets = np.full(len(df), np.nan)
     closes = df['close'].values
@@ -139,7 +141,6 @@ def prepare_features(df, btc_df=None):
 
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    # VWAP sincronizado com o analisador
     typical_price = (df['high'] + df['low'] + df['close']) / 3
     df['vol_price'] = df['volume'] * typical_price
     df['date_only'] = df['datetime'].dt.date
@@ -186,7 +187,6 @@ def prepare_features(df, btc_df=None):
     ema9_macd = df['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
     df['macd_hist_vel'] = (df['MACD_12_26_9'] - ema9_macd).diff(2).fillna(0.0)
 
-    # Limpeza correta alinhada com o analisador
     cols_to_drop = ['vol_price', 'date_only', 'cum_vol_price', 'cum_vol', 'vwap', 'obv', 'obv_slope']
     df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True, errors='ignore')
 
@@ -293,7 +293,14 @@ def cpu_bound_train(symbol, bars, btc_train_df):
         np.asarray(cb_model.predict_proba(X_val))
     ])
 
-    meta_learner = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42, n_jobs=1)
+    # NOVA ARQUITETURA META-LEARNER: Random Forest substituindo a Regressão Logística
+    meta_learner = RandomForestClassifier(
+        n_estimators=50, 
+        max_depth=3, 
+        class_weight='balanced', 
+        random_state=42, 
+        n_jobs=1
+    )
     meta_learner.fit(X_meta_val, y_val)
 
     brain_data = {
