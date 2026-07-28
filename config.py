@@ -62,9 +62,6 @@ class Config:
     MIN_SCORE_ENTRY: float = 6.0
     OPERA_CONTA_REAL: bool = False
 
-
-
-
     BANCA_DEMO_INICIAL: float = 100.0
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
@@ -72,21 +69,19 @@ class Config:
 
     MAX_OPEN_TRADES: int = 5
 
-
     # ---------------------------------------------------------
-    # BARREIRAS DE TREINAMENTO ML (FÔLEGO PARA 35X)
+    # BARREIRAS DE TREINAMENTO ML (SCALPING DE TIRO CURTO)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 10
-    BARRIER_TP_PCT: float = 1.020               # Alvo triplo base: 4% na moeda
-    BARRIER_SL_PCT: float = 0.980               # Stop triplo base: 3% na moeda
-
-
-
+    BARRIER_HORIZON: int = 2                    # Tempo máximo de espera na operação (2 velas)
+    BARRIER_TP_PCT: float = 1.005               # Alvo de lucro muito curto: 0.5% (Tiro rápido)
+    BARRIER_SL_PCT: float = 0.995               # Stop Loss muito curto: 0.5% (Corte rápido)
+    TP_ATR_MULT: float = 1.0                    # Multiplicador ATR para Alvo (Caso o treinador exija)
+    SL_ATR_MULT: float = 0.8                    # Multiplicador ATR para Stop (Caso o treinador exija)
 
     NUM_MOEDAS_OPERACIONAIS: int = 20000
     CICLO_SEGUNDOS: int = 1
-    TEMPO_ESPERA_HOLD_MINUTOS: int = 15
-    TIMEFRAME: str = '15m'
+    TEMPO_ESPERA_HOLD_MINUTOS: int = 5          # Reduzido de 15 para 5 minutos para refletir a urgência
+    TIMEFRAME: str = '5m'                       # Reduzido para 5m para aumentar a frequência de sinais
     CANDLES_TREINAMENTO_ML: int = 7500
     HORAS_RETREINO: int = 24
     NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
