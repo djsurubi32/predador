@@ -87,8 +87,8 @@ class Config:
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 15
     TIMEFRAME: str = '15m'
-    CANDLES_TREINAMENTO_ML: int = 500
-    HORAS_RETREINO: int = 10
+    CANDLES_TREINAMENTO_ML: int = 5000
+    HORAS_RETREINO: int = 24
     NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
     _ATIVOS: List[str] = []
