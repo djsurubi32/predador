@@ -30,11 +30,9 @@ warnings.filterwarnings("ignore")
 class Database:
     def __init__(self, db_name="predador_v31.db"):
         self.db_name = db_name
-        logging.info("Inicializando conexão e verificando tabelas do Banco de Dados...")
         self._create_tables_sync()
 
     def _create_tables_sync(self):
-        # A criação de tabelas ocorre na inicialização de forma síncrona
         with sqlite3.connect(self.db_name, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS trades (
@@ -47,8 +45,6 @@ class Database:
             conn.commit()
 
     async def update_elite_signals(self, signals):
-        # Otimização: bulk insert nativo assíncrono
-        logging.info(f"Atualizando {len(signals)} sinais de elite no banco de dados...")
         now = time.time()
         data_to_insert = [
             (sig['symbol'], sig['direction'], sig['price'], sig['prob'],
@@ -65,8 +61,6 @@ class Database:
             await db.commit()
 
     async def get_open_trades_count(self):
-        # Otimização: consulta nativa assíncrona
-        logging.info("Verificando quantidade de trades atualmente abertos...")
         async with aiosqlite.connect(self.db_name, timeout=30) as db:
             async with db.execute('SELECT COUNT(*) FROM trades') as cursor:
                 res = await cursor.fetchone()
@@ -74,8 +68,6 @@ class Database:
 
 class LiquidityCore:
     def __init__(self):
-        # Otimização: Instâncias assíncronas (aiohttp embarcado cuida do pool de conexões)
-        logging.info("Inicializando motores de liquidez (Binance e Bybit)...")
         self.exchanges = {
             "Binance": ccxt_async.binance({'enableRateLimit': True}),
             "Bybit": ccxt_async.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
@@ -83,9 +75,7 @@ class LiquidityCore:
         self.ob_history = {name: {} for name in self.exchanges.keys()}
 
     async def fetch_liquidity_data(self, exchange, ex_name, symbol_spot):
-        logging.info(f"Buscando dados de Orderbook e Trades para {symbol_spot} na corretora {ex_name}...")
         try:
-            # Otimização: I/O não bloqueante para Orderbook e Trades
             ob = await exchange.fetch_order_book(symbol_spot, limit=20)
             vwap_imb, bid_vol, ask_vol = 50.0, 0.0, 0.0
 
@@ -111,19 +101,15 @@ class LiquidityCore:
                     cvd_buy = sum(t.get('amount', 0) for t in trades if t.get('side') == 'buy')
                     cvd_sell = sum(t.get('amount', 0) for t in trades if t.get('side') == 'sell')
                     if (cvd_buy + cvd_sell) > 0: cvd_imb = (cvd_buy / (cvd_buy + cvd_sell)) * 100
-            except Exception as e:
-                logging.error(f"Erro ao buscar trades no CVD para {symbol_spot} na {ex_name}: {e}")
+            except Exception:
                 pass
 
             return vwap_imb, cvd_imb, spoof_buy, spoof_sell
-        except Exception as e:
-            logging.error(f"Erro geral na busca de liquidez para {symbol_spot} ({ex_name}): {e}")
+        except Exception:
             return 50.0, 50.0, False, False
 
     async def get_liquidity_report(self, symbol):
         symbol_spot = symbol.split(':')[0]
-        logging.info(f"Gerando relatório consolidado de liquidez para o ativo {symbol_spot}...")
-        # Otimização: Tarefas assíncronas diretas (sem to_thread)
         tasks = [self.fetch_liquidity_data(ex, name, symbol_spot) for name, ex in self.exchanges.items()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -141,57 +127,46 @@ class LiquidityCore:
 
 class LocalNewsCore:
     def __init__(self):
-        logging.info("Inicializando motor de Processamento de Linguagem Natural (NLP) para notícias...")
         try:
             self.model = SentenceTransformer(Config.NLP_MODEL_NAME)
             self.bull_emb = self.model.encode(["bull market positive good news surge adoption"])
             self.bear_emb = self.model.encode(["bear market crash negative bad news regulation"])
-            logging.info("Motor NLP carregado com sucesso.")
-        except Exception as e:
-            logging.error(f"Falha ao carregar modelo NLP: {e}")
+        except Exception:
             self.model = None
         self.last_fetch = 0
         self.current_sentiment = 0.0
 
     def fetch_and_score_sync(self):
         if not self.model: return 0.0
-        logging.info("Fazendo requisição de feeds RSS (Cointelegraph / CoinDesk)...")
         titles = []
         for url in ["https://cointelegraph.com/rss", "https://www.coindesk.com/arc/outboundfeeds/rss/"]:
             try:
                 feed = feedparser.parse(url)
                 titles.extend([entry.title for entry in feed.entries[:8]])
-            except Exception as e:
-                logging.error(f"Erro ao capturar RSS de {url}: {e}")
+            except Exception:
                 pass
         
         if not titles: 
-            logging.info("Nenhuma manchete capturada.")
             return 0.0
             
         try:
-            logging.info(f"Analisando sentimento de {len(titles)} manchetes...")
             embs = self.model.encode(titles)
             bull = np.dot(embs, self.bull_emb.T) / (norm(embs, axis=1, keepdims=True) * norm(self.bull_emb))
             bear = np.dot(embs, self.bear_emb.T) / (norm(embs, axis=1, keepdims=True) * norm(self.bear_emb))
             sentiment = float(np.mean(bull - bear))
-            logging.info(f"Score de sentimento calculado: {sentiment:.4f}")
             return sentiment
-        except Exception as e:
-            logging.error(f"Erro no cálculo vetorial de sentimento: {e}")
+        except Exception:
             return 0.0
 
     async def get_sentiment_score(self):
         now = time.time()
         if now - self.last_fetch > 300:
-            logging.info("Iniciando rotina de atualização do sentimento de notícias...")
             self.current_sentiment = await asyncio.to_thread(self.fetch_and_score_sync)
             self.last_fetch = now
         return self.current_sentiment
 
 class RadarCore:
     def __init__(self):
-        logging.info("Inicializando RadarCore: conectando APIs e preparando cérebro analítico...")
         self.public_exchange = ccxt_async.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
         self.db = Database()
         self.liquidity = LiquidityCore()
@@ -205,23 +180,19 @@ class RadarCore:
         path = os.path.join(Config.MODELS_DIR, f"{safe_name}.pkl")
         
         if not os.path.exists(path): 
-            logging.info(f"Modelo para {symbol} não encontrado no caminho {path}.")
             return None
 
         file_mod_time = os.path.getmtime(path)
         if symbol not in self.loaded_models or self.loaded_models[symbol]['mod_time'] < file_mod_time:
             try:
                 if len(self.loaded_models) >= self.MAX_MODELS_IN_RAM:
-                    # Otimização: Remove o modelo mais antigo acessado para evitar vazamento
                     oldest = min(self.loaded_models, key=lambda k: self.loaded_models[k]['mod_time'])
                     del self.loaded_models[oldest]
-                    logging.info(f"Limpando da memória o modelo mais antigo: {oldest}")
+                    logging.info(f"Limpando RAM: Modelo {oldest} removido.")
                 
-                logging.info(f"Carregando modelo (brain) em memória para {symbol}...")
                 brain = joblib.load(path)
                 self.loaded_models[symbol] = {'brain': brain, 'mod_time': file_mod_time}
-            except Exception as e:
-                logging.error(f"Erro ao carregar modelo para {symbol}: {e}")
+            except Exception:
                 return None
         return self.loaded_models[symbol]['brain']
 
@@ -234,7 +205,6 @@ class RadarCore:
 
         df['SMA_ATR_100'] = df['ATRr_14'].rolling(window=100).mean() if 'ATRr_14' in df.columns else 0.0
 
-        # Otimização: Conversão eficiente de colunas numéricas
         numeric_cols = df.columns
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
         df.ffill(inplace=True)
@@ -317,7 +287,6 @@ class RadarCore:
         roll50 = df['close'].rolling(50)
         df['z_score_50'] = ((df['close'] - roll50.mean()) / (roll50.std() + 1e-9)).fillna(0.0)
 
-        # Otimização: Aceleração no cálculo da autocorrelação
         df['autocorr_3'] = df['log_return'].rolling(20).apply(lambda x: x.autocorr(lag=3) if len(x) >= 4 else 0, raw=False).fillna(0.0)
 
         n_period = 20
@@ -388,35 +357,33 @@ class RadarCore:
             ))
             final_probs = brain['meta'].predict_proba(X_meta)[0]
 
+            # Probabilidades extraídas para Alta e Queda
             prob_alta = final_probs[1] * 100 if len(final_probs) > 1 else 0
             prob_queda = final_probs[2] * 100 if len(final_probs) > 2 else 0
 
-            if prob_alta >= 60.0: return "ALTA", prob_alta
-            elif prob_queda >= 60.0: return "QUEDA", prob_queda
-            else: return "Inconclusivo", max(prob_alta, prob_queda)
-        except Exception as e:
-            logging.error(f"Erro no predict_with_brain: {e}")
-            return "Erro", 0.0
+            if prob_alta >= 60.0: 
+                return "ALTA", prob_alta, prob_queda
+            elif prob_queda >= 60.0: 
+                return "QUEDA", prob_alta, prob_queda
+            else: 
+                return "HOLD", prob_alta, prob_queda
+        except Exception:
+            return "Erro", 0.0, 0.0
 
     async def analyze_symbol(self, symbol, news_sentiment):
         if time.time() < self.next_trade_time.get(symbol, 0): 
             return None
             
-        logging.info(f"Analisando ativo: {symbol}")
         brain = self.load_brain(symbol)
         if not brain: 
             return None
 
         try:
-            # Otimização: Coleta de dados assíncrona não bloqueante
-            logging.info(f"[{symbol}] Buscando histórico de preços OHLCV...")
             ohlcv = await self.public_exchange.fetch_ohlcv(symbol, Config.TIMEFRAME, limit=400)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            logging.info(f"[{symbol}] Computando features matemáticas e técnicas...")
             df = self.prepare_features(df, None)
             if len(df) < 30: 
-                logging.info(f"[{symbol}] Dados insuficientes após preparo de features.")
                 return None
 
             raw_price = df.iloc[-1]['close']
@@ -426,17 +393,19 @@ class RadarCore:
 
             bb_pos = float(df.iloc[-1].get('bb_pos', 0.5))
 
-            logging.info(f"[{symbol}] Executando predição dos Modelos de Machine Learning...")
-            ml_text, ml_prob = self.predict_with_brain(brain, df.iloc[-1].to_dict())
-            direction = 'BUY' if "ALTA" in ml_text else 'SELL' if "QUEDA" in ml_text else 'HOLD'
+            # Recebendo as probabilidades detalhadas
+            ml_text, prob_alta, prob_queda = self.predict_with_brain(brain, df.iloc[-1].to_dict())
+            
+            direction = 'BUY' if ml_text == "ALTA" else 'SELL' if ml_text == "QUEDA" else 'HOLD'
+            ml_prob = max(prob_alta, prob_queda)
             
             if direction == 'HOLD': 
-                logging.info(f"[{symbol}] Modelos de ML indicaram HOLD (Inconclusivo).")
+                # Imprimindo as notas exatas da Inteligência Artificial quando fica Inconclusivo
+                logging.info(f"[{symbol}] HOLD - ML Inconclusivo (Alta: {prob_alta:.2f}% | Queda: {prob_queda:.2f}%)")
                 return None
 
             vwap_dict, cvd_dict, spoof_buy_dict, spoof_sell_dict = await self.liquidity.get_liquidity_report(symbol)
 
-            logging.info(f"[{symbol}] Calculando Conviction Score (ML + Espaço + Liquidez)...")
             score, force, reasoning = self.calculate_conviction_score(
                 direction, ml_prob, vwap_dict, cvd_dict, spoof_buy_dict, spoof_sell_dict,
                 news_sentiment, current_atr, raw_price, bb_pos
@@ -448,8 +417,7 @@ class RadarCore:
                 'sma_atr': sma_atr, 'funding': 0.0, 'reasoning': reasoning,
                 'expected_move': expected_move_pct
             }
-        except Exception as e:
-            logging.error(f"Erro na análise principal de {symbol}: {e}")
+        except Exception:
             return None
 
     def calculate_conviction_score(self, direction, ml_prob, vwap_dict, cvd_dict, spoof_buy_dict, spoof_sell_dict, nlp_sentiment, current_atr, raw_price, bb_pos):
@@ -513,9 +481,8 @@ class RadarCore:
 
     async def scan_market(self):
         ativos = Config.get_ativos()
-        logging.info(f"📡 Iniciando ciclo: Varrendo {len(ativos)} moedas na Nova Escala (0 a 10)...")
+        logging.info(f"📡 Iniciando ciclo: Varrendo {len(ativos)} moedas...")
 
-        # Otimização: Semáforo para limitar a concorrência e evitar rate limits pesados nas Exchanges
         max_concurrent_requests = 10
         semaphore = asyncio.Semaphore(max_concurrent_requests)
 
@@ -527,29 +494,25 @@ class RadarCore:
             try:
                 open_trades = await self.db.get_open_trades_count()
                 if open_trades >= Config.MAX_OPEN_TRADES:
-                    logging.info("⏸️ Balde global cheio (Limite de Trades Atingido). Radar em espera por 60 segundos.")
+                    logging.info("⏸️ Limite de Trades Atingido. Radar em espera.")
                     await asyncio.sleep(60)
                     continue
 
                 nlp_score = await self.news.get_sentiment_score()
-
-                # Otimização: Varredura executada de forma concorrente em blocos
-                logging.info("Disparando tarefas assíncronas para análise simultânea dos ativos...")
+                
                 tasks = [process_asset(s, nlp_score) for s in ativos]
                 results = await asyncio.gather(*tasks)
 
                 cycle_opportunities = [r for r in results if r is not None]
 
                 if cycle_opportunities:
-                    logging.info("Processando oportunidades filtradas do ciclo...")
                     all_sorted = sorted(cycle_opportunities, key=lambda x: (x['score'], x['expected_move'], x['prob']), reverse=True)
                     top_opps = [opp for opp in all_sorted if opp['score'] >= Config.MIN_SCORE_ENTRY][:20]
 
                     if top_opps:
                         await self.db.update_elite_signals(top_opps)
-                        logging.info(f"🏆 Mesa do Leilão atualizada com {len(top_opps)} oportunidades viáveis.")
                         for opp in top_opps:
-                            logging.info(f"🔥 SINAL DETETADO ({opp['symbol']}): {opp['direction']} | Score: {opp['score']:.1f}/10 | {opp['reasoning']}")
+                            logging.info(f"🔥 SINAL DETECTADO ({opp['symbol']}): {opp['direction']} | Score: {opp['score']:.1f}/10 | {opp['reasoning']}")
                             self.next_trade_time[opp['symbol']] = time.time() + (Config.TEMPO_ESPERA_HOLD_MINUTOS * 60)
                         for opp in all_sorted:
                             if opp['score'] < Config.MIN_SCORE_ENTRY:
@@ -557,7 +520,7 @@ class RadarCore:
                     else:
                         await self.db.update_elite_signals([])
                         best_5 = all_sorted[:5]
-                        relatorio = f"♻️ Varredura concluída. Nenhuma atingiu o corte ({Config.MIN_SCORE_ENTRY}/10).\n"
+                        relatorio = f"♻️ Nenhuma atingiu o corte ({Config.MIN_SCORE_ENTRY}/10).\n"
                         for i, opp in enumerate(best_5, 1):
                             relatorio += f"   {i}º {opp['symbol']} ({opp['direction']}) | Score: {opp['score']:.1f} | Motivo: {opp['reasoning']}\n"
                         logging.info(relatorio.strip())
@@ -565,9 +528,8 @@ class RadarCore:
                             self.next_trade_time[opp['symbol']] = time.time() + (Config.TEMPO_ESPERA_HOLD_MINUTOS * 60)
                 else:
                     await self.db.update_elite_signals([])
-                    logging.info(f"♻️ Varredura concluída. Mercado em total indefinição (Sem oportunidades).")
 
-                logging.info(f"⏳ Aguardando {Config.CICLO_SEGUNDOS} segundos para o próximo ciclo do radar...")
+                logging.info(f"⏳ Fim do ciclo. Aguardando {Config.CICLO_SEGUNDOS} segundos...")
                 await asyncio.sleep(Config.CICLO_SEGUNDOS)
             except Exception as e:
                 logging.error(f"Erro crítico no loop principal do radar: {e}")
@@ -577,4 +539,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(RadarCore().scan_market())
     except KeyboardInterrupt:
-        logging.info("🛑 Analisador encerrado pelo usuário via teclado.")
+        pass
