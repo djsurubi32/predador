@@ -24,6 +24,8 @@ class GerenciadorRiscoAutonomo:
 
         # Estado interno por símbolo
         self.posicoes_monitoradas = {}
+        # Sistema anti-loop para atrasos de API
+        self.fechamento_em_andamento = {} 
 
         self.last_summary_time = time.time()
         self.pnl_realizado_acumulado = 0.0
@@ -137,6 +139,15 @@ class GerenciadorRiscoAutonomo:
             symbol = p.get('symbol')
             if not symbol:
                 continue
+                
+            # --- QUARENTENA ANTI-LOOP (RACE CONDITION) ---
+            # Ignora moedas que mandamos fechar nos últimos 30s. A API da Bybit demora para limpar o cache.
+            if symbol in self.fechamento_em_andamento:
+                if time.time() - self.fechamento_em_andamento[symbol] < 30:
+                    continue 
+                else:
+                    # Passou 30s e a posição ainda existe? O fechamento falhou na corretora. Libera para tentar de novo.
+                    del self.fechamento_em_andamento[symbol]
 
             symbols_ativos.add(symbol)
 
@@ -238,6 +249,8 @@ class GerenciadorRiscoAutonomo:
 
             # --- CATRACA DE SOFTWARE (Hard Take Profit) ---
             if pnl_em_r >= 1.98:
+                self.fechamento_em_andamento[symbol] = time.time() # Trava para evitar loops
+                
                 msg = (
                     f"🏆 <b>ALVO 2R ATINGIDO (VIA SOFTWARE)</b>\n"
                     f"Moeda: {symbol}\n"
@@ -249,18 +262,17 @@ class GerenciadorRiscoAutonomo:
                 
                 try:
                     close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
-                    if getattr(Config, 'OPERA_CONTA_REAL', False):
-                        await self.executor.execution.exchange.create_order(
-                            symbol=symbol,
-                            type='market',
-                            side=close_side,
-                            amount=qty,
-                            params={'reduceOnly': True}
-                        )
+                    await self.executor.execution.exchange.create_order(
+                        symbol=symbol,
+                        type='market',
+                        side=close_side,
+                        amount=qty,
+                        params={'reduceOnly': True}
+                    )
                 except Exception as e:
-                    logging.error(f"[{symbol}] Falha ao fechar posição a mercado via corretora: {e}")
+                    logging.error(f"[{symbol}] Falha ao fechar posição a mercado na API: {e}")
                 finally:
-                    # Deleção cirúrgica forçada no banco SQLite
+                    # Deleção cirúrgica forçada no banco SQLite e memória
                     async with aiosqlite.connect(db_name, timeout=30) as db_conn:
                         await db_conn.execute("DELETE FROM trades WHERE symbol = ?", (symbol,))
                         await db_conn.commit()
@@ -273,6 +285,8 @@ class GerenciadorRiscoAutonomo:
 
             # --- CATRACA DE SOFTWARE (Hard Stop Loss) ---
             if pnl_em_r <= -1.0: 
+                self.fechamento_em_andamento[symbol] = time.time() # Trava para evitar loops
+                
                 msg = (
                     f"🚨 <b>STOP LOSS EXECUTADO (VIA SOFTWARE)</b>\n"
                     f"Moeda: {symbol}\n"
@@ -284,18 +298,17 @@ class GerenciadorRiscoAutonomo:
                 
                 try:
                     close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
-                    if getattr(Config, 'OPERA_CONTA_REAL', False):
-                        await self.executor.execution.exchange.create_order(
-                            symbol=symbol,
-                            type='market',
-                            side=close_side,
-                            amount=qty,
-                            params={'reduceOnly': True}
-                        )
+                    await self.executor.execution.exchange.create_order(
+                        symbol=symbol,
+                        type='market',
+                        side=close_side,
+                        amount=qty,
+                        params={'reduceOnly': True}
+                    )
                 except Exception as e:
-                    logging.error(f"[{symbol}] Falha ao executar Stop Loss a mercado via corretora: {e}")
+                    logging.error(f"[{symbol}] Falha ao executar Stop Loss a mercado na API: {e}")
                 finally:
-                    # Deleção cirúrgica forçada no banco SQLite
+                    # Deleção cirúrgica forçada no banco SQLite e memória
                     async with aiosqlite.connect(db_name, timeout=30) as db_conn:
                         await db_conn.execute("DELETE FROM trades WHERE symbol = ?", (symbol,))
                         await db_conn.commit()
