@@ -73,7 +73,7 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DO ANALISADOR E IA (Corte Dinâmico)
     # ---------------------------------------------------------
-    MIN_SCORE_ENTRY: float = 6.0
+    MIN_SCORE_ENTRY: float = 5.0
     
     MIN_PROB_PREDICT: float = 60.0       
     MIN_PROB_CONVICTION: float = 60.0    
