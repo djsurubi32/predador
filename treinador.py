@@ -17,7 +17,8 @@ from catboost import CatBoostClassifier
 # Importando o novo Meta-Modelo (Random Forest)
 from sklearn.ensemble import RandomForestClassifier
 
-from config import Config
+# Importamos o Config e o novo universe_provider assíncrono
+from config import Config, universe_provider
 from ta_indicators import add_custom_ta
 
 logging.basicConfig(
@@ -293,7 +294,6 @@ def cpu_bound_train(symbol, bars, btc_train_df):
         np.asarray(cb_model.predict_proba(X_val))
     ])
 
-    # NOVA ARQUITETURA META-LEARNER: Random Forest substituindo a Regressão Logística
     meta_learner = RandomForestClassifier(
         n_estimators=50, 
         max_depth=3, 
@@ -303,9 +303,16 @@ def cpu_bound_train(symbol, bars, btc_train_df):
     )
     meta_learner.fit(X_meta_val, y_val)
 
+    # CORREÇÃO: Salvar os feature_names para evitar o "Contrato de Feature violado" 
+    # e garantir a compatibilidade com o analisador refatorado.
     brain_data = {
-        'hmm': hmm_model, 'lgbm': lgbm, 'xgb': xgb_model, 'catboost': cb_model,
-        'meta': meta_learner, 'last_trained': int(time.time())
+        'hmm': hmm_model, 
+        'lgbm': lgbm, 
+        'xgb': xgb_model, 
+        'catboost': cb_model,
+        'meta': meta_learner, 
+        'feature_names': features,
+        'last_trained': int(time.time())
     }
 
     safe_symbol_name = symbol.replace('/', '_').replace(':', '_')
@@ -364,17 +371,19 @@ class MotorTreinamento:
             return []
 
     async def get_btc_data(self):
-        ativos = Config.get_ativos()
+        # CORREÇÃO: Utilizando o universe_provider assíncrono para buscar ativos
+        ativos = await universe_provider.get_ativos()
         if not ativos: return []
 
         if time.time() - self.btc_train_time > 3600 or not self.btc_train_cache:
             logging.info("Sincronizando benchmark temporal (BTC) em modo Low-RAM...")
-            self.btc_train_cache = await self.fetch_historical(ativos[0], Config.CANDLES_TREINAMENTO_ML)
+            self.btc_train_cache = await self.fetch_historical(ativos[0], getattr(Config, 'CANDLES_TREINAMENTO_ML', 7000))
             self.btc_train_time = time.time()
         return self.btc_train_cache
 
     async def iniciar_ciclo_treinamento(self):
-        ativos = Config.get_ativos()
+        # CORREÇÃO: Utilizando o universe_provider assíncrono para buscar ativos
+        ativos = await universe_provider.get_ativos()
         logging.info(f"🚀 Iniciando Forja Institucional (Modo Low-RAM VPS) para {len(ativos)} moedas...")
 
         btc_data_raw = await self.get_btc_data()
@@ -385,7 +394,7 @@ class MotorTreinamento:
         with ThreadPoolExecutor(max_workers=1) as pool:
             for symbol in ativos:
                 logging.info(f"📥 Baixando histórico de {symbol}...")
-                bars = await self.fetch_historical(symbol, Config.CANDLES_TREINAMENTO_ML)
+                bars = await self.fetch_historical(symbol, getattr(Config, 'CANDLES_TREINAMENTO_ML', 7000))
 
                 if not bars:
                     continue
@@ -403,7 +412,7 @@ class MotorTreinamento:
                 del bars
                 gc.collect()
 
-        logging.info(f"💤 Treinamento blindado concluído. O motor vai hibernar por {Config.HORAS_RETREINO} horas.")
+        logging.info(f"💤 Treinamento blindado concluído. O motor vai hibernar por {getattr(Config, 'HORAS_RETREINO', 24)} horas.")
 
 async def main():
     treinador = MotorTreinamento()
@@ -411,7 +420,7 @@ async def main():
         try:
             await treinador.iniciar_ciclo_treinamento()
             logging.info("Aguardando próximo ciclo...")
-            await asyncio.sleep(Config.HORAS_RETREINO * 3600)
+            await asyncio.sleep(getattr(Config, 'HORAS_RETREINO', 24) * 3600)
         except Exception as e:
             logging.error(f"Erro Crítico no Loop do Treinador: {e}")
             await asyncio.sleep(60)
