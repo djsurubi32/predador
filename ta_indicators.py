@@ -1,52 +1,69 @@
 import pandas as pd
 import numpy as np
 
+# Quantidade de barras a descartar na preparação final do modelo
+# Garante a convergência matemática e elimina falsas "features" (warmup)
+WARMUP_BARS = 100
+
 def add_custom_ta(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Motor interno de Análise Técnica Vetorizada.
-    Substitui completamente a dependência externa do pandas-ta.
+    Motor interno de Análise Técnica Vetorizada de Alta Performance.
+    Substitui completamente a dependência externa do pandas-ta[cite: 3].
     """
-    # 1. EMA 20
-    df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
+    # 1. Validação Estrutural e de Contrato
+    if len(df) < WARMUP_BARS:
+        raise ValueError(f"Série temporal truncada. Mínimo exigido: {WARMUP_BARS} barras para convergência.")
 
-    # 2. Bollinger Bands (20, 2)
-    sma20 = df['close'].rolling(window=20).mean()
-    std20 = df['close'].rolling(window=20).std()
-    df['BBL_20_2.0'] = sma20 - (2 * std20)
-    df['BBU_20_2.0'] = sma20 + (2 * std20)
+    if 'timestamp' in df.columns and not df['timestamp'].is_monotonic_increasing:
+        raise ValueError("Falha de ordenação cronológica detectada no DataFrame.")
 
-    # 3. RSI 14 (Wilder's Smoothing)
-    delta = df['close'].diff()
+    # Proteção do chamador (Prevenção de mutação in-place)
+    out = df.copy()
+
+    # 2. EMA 20
+    out['EMA_20'] = out['close'].ewm(span=20, adjust=False).mean()
+
+    # 3. Bollinger Bands (20, 2) com desvio populacional real (ddof=0)
+    sma20 = out['close'].rolling(window=20).mean()
+    std20 = out['close'].rolling(window=20).std(ddof=0)
+    out['BBL_20_2.0'] = sma20 - (2 * std20)
+    out['BBU_20_2.0'] = sma20 + (2 * std20)
+
+    # 4. RSI 14 (Lógica algébrica sem divisão por epsilon)
+    delta = out['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
+
     ema_up = up.ewm(alpha=1/14, adjust=False).mean()
     ema_down = down.ewm(alpha=1/14, adjust=False).mean()
-    # Proteção 1e-9 contra divisão por zero em momentos sem volatilidade
-    rs = ema_up / (ema_down + 1e-9)
-    df['RSI_14'] = np.where(ema_down == 0, 100, 100 - (100 / (1 + rs)))
 
-    # 4. ATR 14 (Average True Range)
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - df['close'].shift()).abs()
-    tr3 = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df['ATRr_14'] = tr.ewm(alpha=1/14, adjust=False).mean()
+    soma_rsi = ema_up + ema_down
+    # Em caso de paralisia de mercado (soma == 0), reverte ao centro natural de força (50.0)
+    out['RSI_14'] = np.where(soma_rsi > 0, 100.0 * ema_up / soma_rsi, 50.0)
 
-    # 5. ADX 14 (Average Directional Index)
-    up_m = df['high'] - df['high'].shift()
-    down_m = df['low'].shift() - df['low']
+    # 5. ATR 14 (Otimização vetorizada usando matrizes C-contíguas)
+    tr1 = out['high'] - out['low']
+    tr2 = (out['high'] - out['close'].shift()).abs()
+    tr3 = (out['low'] - out['close'].shift()).abs()
+
+    tr_arr = np.maximum(tr1.to_numpy(), np.maximum(tr2.to_numpy(), tr3.to_numpy()))
+    tr = pd.Series(tr_arr, index=out.index)
+    out['ATRr_14'] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    # 6. ADX 14 (Cancelamento analítico do True Range e do epsilon)
+    up_m = out['high'] - out['high'].shift()
+    down_m = out['low'].shift() - out['low']
+
     plus_dm = np.where((up_m > down_m) & (up_m > 0), up_m, 0.0)
     minus_dm = np.where((down_m > up_m) & (down_m > 0), down_m, 0.0)
 
-    tr_smooth = tr.ewm(alpha=1/14, adjust=False).mean()
-    plus_dm_smooth = pd.Series(plus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean()
-    minus_dm_smooth = pd.Series(minus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean()
+    plus_dm_smooth = pd.Series(plus_dm, index=out.index).ewm(alpha=1/14, adjust=False).mean()
+    minus_dm_smooth = pd.Series(minus_dm, index=out.index).ewm(alpha=1/14, adjust=False).mean()
 
-    # Proteção 1e-9 nos denominadores do ADX
-    plus_di = 100 * (plus_dm_smooth / (tr_smooth + 1e-9))
-    minus_di = 100 * (minus_dm_smooth / (tr_smooth + 1e-9))
+    dm_sum = plus_dm_smooth + minus_dm_smooth
+    dx = np.where(dm_sum > 0, 100.0 * (plus_dm_smooth - minus_dm_smooth).abs() / dm_sum, 0.0)
 
-    dx = 100 * (plus_di - minus_di).abs() / ((plus_di + minus_di).abs() + 1e-9)
-    df['ADX_14'] = dx.ewm(alpha=1/14, adjust=False).mean()
+    dx_series = pd.Series(dx, index=out.index)
+    out['ADX_14'] = dx_series.ewm(alpha=1/14, adjust=False).mean()
 
-    return df
+    return out
