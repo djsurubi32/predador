@@ -84,13 +84,16 @@ class LiquidityCore:
                 bid_vol = sum(vol * math.exp(-50 * abs(price - mid_price) / mid_price) for price, vol in ob['bids'][:10])
                 ask_vol = sum(vol * math.exp(-50 * abs(price - mid_price) / mid_price) for price, vol in ob['asks'][:10])
                 total = bid_vol + ask_vol
-                if total > 0: vwap_imb = (bid_vol / total) * 100
+                if total > 0: 
+                    vwap_imb = (bid_vol / total) * 100
 
             spoof_buy, spoof_sell = False, False
             prev = self.ob_history[ex_name].get(symbol_spot)
             if prev:
-                if prev['bids'] > 0 and (prev['bids'] - bid_vol) / prev['bids'] > 0.35: spoof_buy = True
-                if prev['asks'] > 0 and (prev['asks'] - ask_vol) / prev['asks'] > 0.35: spoof_sell = True
+                if prev['bids'] > 0 and (prev['bids'] - bid_vol) / prev['bids'] > 0.35: 
+                    spoof_buy = True
+                if prev['asks'] > 0 and (prev['asks'] - ask_vol) / prev['asks'] > 0.35: 
+                    spoof_sell = True
 
             self.ob_history[ex_name][symbol_spot] = {'bids': bid_vol, 'asks': ask_vol}
 
@@ -100,7 +103,8 @@ class LiquidityCore:
                 if trades:
                     cvd_buy = sum(t.get('amount', 0) for t in trades if t.get('side') == 'buy')
                     cvd_sell = sum(t.get('amount', 0) for t in trades if t.get('side') == 'sell')
-                    if (cvd_buy + cvd_sell) > 0: cvd_imb = (cvd_buy / (cvd_buy + cvd_sell)) * 100
+                    if (cvd_buy + cvd_sell) > 0: 
+                        cvd_imb = (cvd_buy / (cvd_buy + cvd_sell)) * 100
             except Exception:
                 pass
 
@@ -138,7 +142,8 @@ class LocalNewsCore:
         self.current_sentiment = 0.0
 
     def fetch_and_score_sync(self):
-        if not self.model: return 0.0
+        if not self.model: 
+            return 0.0
         titles = []
         for url in ["https://cointelegraph.com/rss", "https://www.coindesk.com/arc/outboundfeeds/rss/"]:
             try:
@@ -174,12 +179,11 @@ class RadarCore:
         self.news = LocalNewsCore()
         self.next_trade_time = {ativo: 0 for ativo in Config.get_ativos()}
         self.loaded_models = {}
-        # Parametrizado
         self.MAX_MODELS_IN_RAM = getattr(Config, 'MAX_MODELS_IN_RAM', 30)
 
     def load_brain(self, symbol):
         safe_name = symbol.replace('/', '_').replace(':', '_')
-        models_dir = getattr(Config, 'MODELS_DIR', 'modelos')
+        models_dir = getattr(Config, 'MODELS_DIR', 'modelos_ia')
         path = os.path.join(models_dir, f"{safe_name}.pkl")
         
         if not os.path.exists(path): 
@@ -348,7 +352,7 @@ class RadarCore:
             if hasattr(brain.get('hmm'), 'predict'):
                 try: 
                     X_pred['hmm_regime'] = brain['hmm'].predict(X_pred[['log_return', 'volatility_cluster']])
-                except: 
+                except Exception: 
                     X_pred['hmm_regime'] = 0
             else:
                 X_pred['hmm_regime'] = 0
@@ -363,7 +367,6 @@ class RadarCore:
             prob_alta = final_probs[1] * 100 if len(final_probs) > 1 else 0
             prob_queda = final_probs[2] * 100 if len(final_probs) > 2 else 0
 
-            # CORREÇÃO 1: Utilizando o limite do config dinâmico
             min_prob_predict = getattr(Config, 'MIN_PROB_PREDICT', 52.0)
 
             if prob_alta >= min_prob_predict: 
@@ -423,4 +426,154 @@ class RadarCore:
                 'expected_move': expected_move_pct
             }
         except Exception:
-    
+            return None
+
+    def calculate_conviction_score(self, direction, ml_prob, vwap_dict, cvd_dict, spoof_buy_dict, spoof_sell_dict, nlp_sentiment, current_atr, raw_price, bb_pos):
+        
+        bb_top = getattr(Config, 'BB_POS_TOP_VETO', 0.95)
+        bb_bot = getattr(Config, 'BB_POS_BOTTOM_VETO', 0.05)
+        
+        if direction == 'BUY' and bb_pos >= bb_top:
+            return 0, 1, f"VETO ESPAÇO RIGIDO: Compra de Topo Bloqueada (bb_pos={bb_pos:.2f})."
+        if direction == 'SELL' and bb_pos <= bb_bot:
+            return 0, 1, f"VETO ESPAÇO RIGIDO: Venda de Fundo Bloqueada (bb_pos={bb_pos:.2f})."
+
+        ml_pts = 0.0
+        min_conviction = getattr(Config, 'MIN_PROB_CONVICTION', 52.0)
+        
+        if ml_prob >= getattr(Config, 'PROB_TIER_4', 90.0): 
+            ml_pts = 4.0
+        elif ml_prob >= getattr(Config, 'PROB_TIER_3', 85.0): 
+            ml_pts = 3.0
+        elif ml_prob >= getattr(Config, 'PROB_TIER_2', 75.0): 
+            ml_pts = 2.0
+        elif ml_prob >= min_conviction: 
+            ml_pts = 1.0
+        else: 
+            return 0, 1, f"VETO ML: Probabilidade Baixa ({ml_prob:.1f}%)."
+
+        expected_move_pct = (current_atr * 2.0 / raw_price) * 100.0
+        espaco_pts = 0.0
+        min_move = getattr(Config, 'MIN_EXPECTED_MOVE_PCT', 0.4)
+        
+        if expected_move_pct >= getattr(Config, 'ALVO_TIER_3', 1.5): 
+            espaco_pts = 4.0
+        elif expected_move_pct >= getattr(Config, 'ALVO_TIER_2', 0.8): 
+            espaco_pts = 3.0
+        elif expected_move_pct >= min_move: 
+            espaco_pts = 2.0
+        else: 
+            return 0, 1, f"VETO ESPAÇO: Alvo muito curto ({expected_move_pct:.2f}%)."
+
+        liq_pts = 0.0
+        apoios = []
+
+        if direction == 'BUY' and vwap_dict.get('Binance', 50) >= 50.5:
+            liq_pts += 1.0
+            apoios.append('Binance_VWAP')
+        elif direction == 'SELL' and vwap_dict.get('Binance', 50) <= 49.8:
+            liq_pts += 1.0
+            apoios.append('Binance_VWAP')
+
+        if direction == 'BUY' and vwap_dict.get('Bybit', 50) >= 50.5:
+            liq_pts += 1.0
+            apoios.append('Bybit_VWAP')
+        elif direction == 'SELL' and vwap_dict.get('Bybit', 50) <= 49.8:
+            liq_pts += 1.0
+            apoios.append('Bybit_VWAP')
+
+        cvd_buy = cvd_dict.get('Binance', 50.0) >= 50.2 or cvd_dict.get('Bybit', 50.0) >= 50.5
+        cvd_sell = cvd_dict.get('Binance', 50.0) <= 49.8 or cvd_dict.get('Bybit', 50.0) <= 49.8
+        if direction == 'BUY' and cvd_buy:
+            liq_pts += 1.0
+            apoios.append('CVD')
+        if direction == 'SELL' and cvd_sell:
+            liq_pts += 1.0
+            apoios.append('CVD')
+
+        if liq_pts < 1.0: 
+            return 0, 1, "VETO VWAP: Sem apoio de liquidez institucional."
+
+        spoof_buy = spoof_buy_dict.get('Binance', False) or spoof_buy_dict.get('Bybit', False)
+        spoof_sell = spoof_sell_dict.get('Binance', False) or spoof_sell_dict.get('Bybit', False)
+        if direction == 'BUY' and spoof_buy: 
+            return 0, 1, "VETO SPOOFING."
+        if direction == 'SELL' and spoof_sell: 
+            return 0, 1, "VETO SPOOFING."
+
+        total = ml_pts + espaco_pts + liq_pts
+        detalhes = ", ".join(apoios) if apoios else "Nenhum"
+        motivo_detalhado = f"ML_Dir:{ml_pts:.1f} | ML_Espaço:{espaco_pts:.1f}({expected_move_pct:.1f}%) | Fluxo:{liq_pts:.1f}({detalhes})"
+
+        return total, (2 if total >= 7.5 else 1), motivo_detalhado
+
+    async def scan_market(self):
+        ativos = Config.get_ativos()
+        logging.info(f"📡 Iniciando ciclo: Varrendo {len(ativos)} moedas...")
+
+        max_concurrent_requests = 10
+        semaphore = asyncio.Semaphore(max_concurrent_requests)
+
+        async def process_asset(symbol, nlp_score):
+            async with semaphore:
+                return await self.analyze_symbol(symbol, nlp_score)
+
+        while True:
+            try:
+                max_open = getattr(Config, 'MAX_OPEN_TRADES', 5)
+                open_trades = await self.db.get_open_trades_count()
+                
+                if open_trades >= max_open:
+                    logging.info("⏸️ Limite de Trades Atingido. Radar em espera.")
+                    await asyncio.sleep(60)
+                    continue
+
+                nlp_score = await self.news.get_sentiment_score()
+                
+                tasks = [process_asset(s, nlp_score) for s in ativos]
+                results = await asyncio.gather(*tasks)
+
+                cycle_opportunities = [r for r in results if r is not None]
+
+                min_score = getattr(Config, 'MIN_SCORE_ENTRY', 5.2)
+                espera_minutos = getattr(Config, 'TEMPO_ESPERA_HOLD_MINUTOS', 5)
+                
+                if cycle_opportunities:
+                    all_sorted = sorted(cycle_opportunities, key=lambda x: (x['score'], x['expected_move'], x['prob']), reverse=True)
+                    top_opps = [opp for opp in all_sorted if opp['score'] >= min_score][:20]
+
+                    if top_opps:
+                        await self.db.update_elite_signals(top_opps)
+                        for opp in top_opps:
+                            logging.info(f"🔥 SINAL DETECTADO ({opp['symbol']}): {opp['direction']} | Score: {opp['score']:.1f}/10 | {opp['reasoning']}")
+                            self.next_trade_time[opp['symbol']] = time.time() + (espera_minutos * 60)
+                        for opp in all_sorted:
+                            if opp['score'] < min_score:
+                                self.next_trade_time[opp['symbol']] = time.time() + (espera_minutos * 60)
+                    else:
+                        await self.db.update_elite_signals([])
+                        best_5 = all_sorted[:5]
+                        relatorio = f"♻️ Nenhuma atingiu o corte ({min_score}/10).\n"
+                        for i, opp in enumerate(best_5, 1):
+                            relatorio += f"   {i}º {opp['symbol']} ({opp['direction']}) | Score: {opp['score']:.1f} | Motivo: {opp['reasoning']}\n"
+                        logging.info(relatorio.strip())
+                        for opp in all_sorted:
+                            self.next_trade_time[opp['symbol']] = time.time() + (espera_minutos * 60)
+                else:
+                    await self.db.update_elite_signals([])
+
+                ciclo_segundos = getattr(Config, 'CICLO_SEGUNDOS', 5)
+                logging.info(f"⏳ Fim do ciclo. Aguardando {ciclo_segundos} segundos...")
+                await asyncio.sleep(ciclo_segundos)
+            except Exception as e:
+                logging.error(f"Erro crítico no loop principal do radar: {e}")
+            
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(RadarCore().scan_market())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logging.error(f"Erro na execução principal: {e}")
