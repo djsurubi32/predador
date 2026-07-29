@@ -220,7 +220,15 @@ class GerenciadorRiscoAutonomo:
         for s in symbols_para_remover:
             pnl_fechamento = self.posicoes_monitoradas[s].get("last_net_pnl", 0.0)
             self.pnl_realizado_acumulado += pnl_fechamento
-            logging.info(f"[{s}] Posição encerrada. PnL de ${pnl_fechamento:+.2f}. Novo Saldo: ${self.saldo_atual:.2f}")
+            
+            msg = (
+                f"🏁 <b>POSIÇÃO ENCERRADA (CORRETORA)</b>\n"
+                f"Moeda: {s}\n"
+                f"PnL Realizado: ${pnl_fechamento:+.2f}\n"
+                f"💰 Novo Saldo da Banca: ${self.saldo_atual:.2f}"
+            )
+            await TelegramLogger.send(msg)
+            logging.info(f"[{s}] Posição encerrada na corretora. PnL: ${pnl_fechamento:+.2f} | Saldo: ${self.saldo_atual:.2f}")
             del self.posicoes_monitoradas[s]
 
     async def gerenciar_posicoes_2r(self):
