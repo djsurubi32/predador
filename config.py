@@ -73,10 +73,10 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DO ANALISADOR E IA (Corte Dinâmico)
     # ---------------------------------------------------------
-    MIN_SCORE_ENTRY: float = 5.2
+    MIN_SCORE_ENTRY: float = 6.0
     
-    MIN_PROB_PREDICT: float = 52.0       
-    MIN_PROB_CONVICTION: float = 52.0    
+    MIN_PROB_PREDICT: float = 60.0       
+    MIN_PROB_CONVICTION: float = 60.0    
     
     PROB_TIER_4: float = 90.0            
     PROB_TIER_3: float = 85.0            
@@ -92,7 +92,7 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (ESTRATÉGIA 2:1)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 12                  # 1 hora (12 velas de 5m)
+    BARRIER_HORIZON: int = 5                # 1 hora (12 velas de 5m)
     BARRIER_TP_PCT: float = 1.010              # Alvo: 1.0%
     BARRIER_SL_PCT: float = 0.995              # Stop: 0.5%
     TP_ATR_MULT: float = 1.5                   
@@ -102,7 +102,7 @@ class Config:
     CICLO_SEGUNDOS: int = 5
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5          
     TIMEFRAME: str = '5m'                       
-    CANDLES_TREINAMENTO_ML: int = 3000
+    CANDLES_TREINAMENTO_ML: int = 7000
     HORAS_RETREINO: int = 24
 
     _ATIVOS: List[str] = []
