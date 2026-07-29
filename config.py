@@ -72,17 +72,17 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (SCALPING DE TIRO CURTO)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 50              # Tempo máximo de espera na operação (2 velas)
-    BARRIER_TP_PCT: float = 1.030           # Alvo de lucro muito curto: 0.5% (Tiro rápido)
-    BARRIER_SL_PCT: float = 0.985               # Stop Loss muito curto: 0.5% (Corte rápido)
+    BARRIER_HORIZON: int = 10          # Tempo máximo de espera na operação (2 velas)
+    BARRIER_TP_PCT: float = 1.0050    # Alvo de lucro muito curto: 0.5% (Tiro rápido)
+    BARRIER_SL_PCT: float = 0.9955           # Stop Loss muito curto: 0.5% (Corte rápido)
     TP_ATR_MULT: float = 1.5                   # Multiplicador ATR para Alvo (Caso o treinador exija)
     SL_ATR_MULT: float = 0.8                    # Multiplicador ATR para Stop (Caso o treinador exija)
 
-    NUM_MOEDAS_OPERACIONAIS: int = 50000
-    CICLO_SEGUNDOS: int = 1
+    NUM_MOEDAS_OPERACIONAIS: int = 500
+    CICLO_SEGUNDOS: int = 5
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5          # Reduzido de 15 para 5 minutos para refletir a urgência
     TIMEFRAME: str = '5m'                       # Reduzido para 5m para aumentar a frequência de sinais
-    CANDLES_TREINAMENTO_ML: int = 7500
+    CANDLES_TREINAMENTO_ML: int = 3000
     HORAS_RETREINO: int = 24
     NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
