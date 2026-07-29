@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-def obter_melhores_moedas(limite: int = 50) -> List[str]:
+def obter_melhores_moedas(limite: int = 100) -> List[str]:
     logger.info(f"🔄 Conectando à Bybit para buscar o Top {limite} de criptomoedas blindadas e líquidas...")
     try:
         exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
@@ -67,18 +67,18 @@ class Config:
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
 
-    MAX_OPEN_TRADES: int = 5
+    MAX_OPEN_TRADES: int = 10
 
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (SCALPING DE TIRO CURTO)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 2                    # Tempo máximo de espera na operação (2 velas)
-    BARRIER_TP_PCT: float = 1.010           # Alvo de lucro muito curto: 0.5% (Tiro rápido)
-    BARRIER_SL_PCT: float = 0.995               # Stop Loss muito curto: 0.5% (Corte rápido)
-    TP_ATR_MULT: float = 1.0                    # Multiplicador ATR para Alvo (Caso o treinador exija)
+    BARRIER_HORIZON: int = 12                 # Tempo máximo de espera na operação (2 velas)
+    BARRIER_TP_PCT: float = 1.030           # Alvo de lucro muito curto: 0.5% (Tiro rápido)
+    BARRIER_SL_PCT: float = 0.985               # Stop Loss muito curto: 0.5% (Corte rápido)
+    TP_ATR_MULT: float = 1.5                   # Multiplicador ATR para Alvo (Caso o treinador exija)
     SL_ATR_MULT: float = 0.8                    # Multiplicador ATR para Stop (Caso o treinador exija)
 
-    NUM_MOEDAS_OPERACIONAIS: int = 20000
+    NUM_MOEDAS_OPERACIONAIS: int = 50000
     CICLO_SEGUNDOS: int = 1
     TEMPO_ESPERA_HOLD_MINUTOS: int = 5          # Reduzido de 15 para 5 minutos para refletir a urgência
     TIMEFRAME: str = '5m'                       # Reduzido para 5m para aumentar a frequência de sinais
