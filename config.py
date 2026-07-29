@@ -57,34 +57,53 @@ class Config:
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # INFRAESTRUTURA
+    DB_NAME: str = "predador_v31.db"
     MODELS_DIR: str = "modelos_ia"
+    MAX_MODELS_IN_RAM: int = 30
+    NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
-    MIN_SCORE_ENTRY: float = 5.2
     OPERA_CONTA_REAL: bool = False
-
     BANCA_DEMO_INICIAL: float = 100.0
     KELLY_FRACTION: float = 0.045
     RISK_REWARD_RATIO: float = 2.0
     MAX_POSITION_RISK: float = 0.045
-
     MAX_OPEN_TRADES: int = 10
 
     # ---------------------------------------------------------
-    # BARREIRAS DE TREINAMENTO ML (SCALPING DE TIRO CURTO)
+    # BARREIRAS DO ANALISADOR E IA (Corte Dinâmico)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 10          # Tempo máximo de espera na operação (2 velas)
-    BARRIER_TP_PCT: float = 1.0050    # Alvo de lucro muito curto: 0.5% (Tiro rápido)
-    BARRIER_SL_PCT: float = 0.9955           # Stop Loss muito curto: 0.5% (Corte rápido)
-    TP_ATR_MULT: float = 1.5                   # Multiplicador ATR para Alvo (Caso o treinador exija)
-    SL_ATR_MULT: float = 0.8                    # Multiplicador ATR para Stop (Caso o treinador exija)
+    MIN_SCORE_ENTRY: float = 5.2
+    
+    MIN_PROB_PREDICT: float = 52.0       
+    MIN_PROB_CONVICTION: float = 52.0    
+    
+    PROB_TIER_4: float = 90.0            
+    PROB_TIER_3: float = 85.0            
+    PROB_TIER_2: float = 75.0            
+    
+    MIN_EXPECTED_MOVE_PCT: float = 0.4   
+    ALVO_TIER_3: float = 1.5             
+    ALVO_TIER_2: float = 0.8             
+    
+    BB_POS_TOP_VETO: float = 0.95        
+    BB_POS_BOTTOM_VETO: float = 0.05     
+
+    # ---------------------------------------------------------
+    # BARREIRAS DE TREINAMENTO ML (ESTRATÉGIA 2:1)
+    # ---------------------------------------------------------
+    BARRIER_HORIZON: int = 12                  # 1 hora (12 velas de 5m)
+    BARRIER_TP_PCT: float = 1.010              # Alvo: 1.0%
+    BARRIER_SL_PCT: float = 0.995              # Stop: 0.5%
+    TP_ATR_MULT: float = 1.5                   
+    SL_ATR_MULT: float = 0.8                    
 
     NUM_MOEDAS_OPERACIONAIS: int = 500
     CICLO_SEGUNDOS: int = 5
-    TEMPO_ESPERA_HOLD_MINUTOS: int = 5          # Reduzido de 15 para 5 minutos para refletir a urgência
-    TIMEFRAME: str = '5m'                       # Reduzido para 5m para aumentar a frequência de sinais
+    TEMPO_ESPERA_HOLD_MINUTOS: int = 5          
+    TIMEFRAME: str = '5m'                       
     CANDLES_TREINAMENTO_ML: int = 3000
     HORAS_RETREINO: int = 24
-    NLP_MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
     _ATIVOS: List[str] = []
     _ULTIMA_ATUALIZACAO: float = 0.0
