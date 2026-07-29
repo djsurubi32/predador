@@ -72,7 +72,7 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (SCALPING DE TIRO CURTO)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 12                 # Tempo máximo de espera na operação (2 velas)
+    BARRIER_HORIZON: int = 50              # Tempo máximo de espera na operação (2 velas)
     BARRIER_TP_PCT: float = 1.030           # Alvo de lucro muito curto: 0.5% (Tiro rápido)
     BARRIER_SL_PCT: float = 0.985               # Stop Loss muito curto: 0.5% (Corte rápido)
     TP_ATR_MULT: float = 1.5                   # Multiplicador ATR para Alvo (Caso o treinador exija)
