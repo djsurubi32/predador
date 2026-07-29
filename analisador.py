@@ -193,7 +193,6 @@ class RadarCore:
         self.db = Database()
         self.liquidity = LiquidityCore()
         self.news = LocalNewsCore()
-        # Inicializa vazio, será populado dinamicamente no loop
         self.next_trade_time = {}
         self.loaded_models = OrderedDict()
         self.MAX_MODELS_IN_RAM = getattr(Config, 'MAX_MODELS_IN_RAM', 30)
@@ -303,8 +302,11 @@ class RadarCore:
 
         lag1_var = df['log_return'].rolling(20).var()
         lag5_var = df['close'].pct_change(5).rolling(20).var()
-        df['hurst_proxy'] = (np.log(np.where(lag5_var == 0, 1e-5, lag5_var)) / 
-                             np.log(np.where(lag1_var == 0, 1e-5, lag1_var))).clip(-3.0, 3.0)
+        
+        # CORREÇÃO: Prevenção de divisão por zero no hurst_proxy
+        num_hurst = np.log(np.where(lag5_var <= 0, 1e-5, lag5_var))
+        den_hurst = np.log(np.where(lag1_var <= 0, 1e-5, lag1_var))
+        df['hurst_proxy'] = (num_hurst / np.where(den_hurst == 0, 1e-5, den_hurst)).clip(-3.0, 3.0)
 
         roll50 = df['close'].rolling(50)
         df['z_score_50'] = (df['close'] - roll50.mean()) / np.where(roll50.std() == 0, 1e-5, roll50.std())
@@ -316,8 +318,11 @@ class RadarCore:
         high_max = df['high'].rolling(n_period).max()
         low_min = df['low'].rolling(n_period).min()
         path_length = np.abs(df['close'].diff()).rolling(n_period).sum()
-        df['fractal_dim'] = (np.log(np.where(path_length == 0, 1e-5, path_length)) / 
-                             np.log(np.where((high_max - low_min) == 0, 1e-5, (high_max - low_min)))).clip(-3.0, 3.0)
+        
+        # CORREÇÃO: Prevenção de divisão por zero no fractal_dim
+        num_fractal = np.log(np.where(path_length <= 0, 1e-5, path_length))
+        den_fractal = np.log(np.where((high_max - low_min) <= 0, 1e-5, (high_max - low_min)))
+        df['fractal_dim'] = (num_fractal / np.where(den_fractal == 0, 1e-5, den_fractal)).clip(-3.0, 3.0)
 
         atr_14 = df.get('ATRr_14', df['close'].rolling(14).std())
         kc_upper = df['EMA_20'] + (1.5 * atr_14)
@@ -531,7 +536,6 @@ class RadarCore:
         return total, (2 if total >= 7.5 else 1), f"ML:{ml_pts:.1f}|Espaço:{espaco_pts:.1f}|Fluxo:{liq_pts:.1f}({detalhes})"
 
     async def scan_market(self):
-        # A primeira chamada ao universe_provider acontece aqui dentro agora
         ativos = await universe_provider.get_ativos()
         logging.info(f"📡 Iniciando ciclo: Varrendo {len(ativos)} moedas...")
 
@@ -544,7 +548,6 @@ class RadarCore:
         try:
             while True:
                 try:
-                    # Garantimos que a lista de moedas seja consultada de forma assíncrona a cada ciclo
                     ativos = await universe_provider.get_ativos()
                     
                     if not ativos:
