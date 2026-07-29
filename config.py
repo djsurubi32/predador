@@ -92,8 +92,8 @@ class Config:
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO ML (ESTRATÉGIA 2:1)
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = 5                # 1 hora (12 velas de 5m)
-    BARRIER_TP_PCT: float = 1.010              # Alvo: 1.0%
+    BARRIER_HORIZON: int = 10          # 1 hora (12 velas de 5m)
+    BARRIER_TP_PCT: float = 1.006           # Alvo: 1.0%
     BARRIER_SL_PCT: float = 0.995              # Stop: 0.5%
     TP_ATR_MULT: float = 1.5                   
     SL_ATR_MULT: float = 0.8                    
