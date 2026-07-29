@@ -3,6 +3,7 @@ import os
 import asyncio
 import logging
 import time
+import aiosqlite
 import numpy as np
 from config import Config
 from executor import EngineExecutor, TelegramLogger
@@ -68,7 +69,7 @@ class GerenciadorRiscoAutonomo:
                 if time.time() < cooldown:
                     continue
 
-                # CORREÇÃO 1: Forçando o SL de 0.5% (distância fixa da entrada)
+                # Distância fixa do SL de 0.5% a partir do preço de entrada
                 distancia_sl_pct = 0.005 
                 
                 if direction in ['BUY', 'LONG']:
@@ -79,7 +80,7 @@ class GerenciadorRiscoAutonomo:
                 alvos = self._calcular_risco_e_alvos(entry, sl, direction)
                 tp = alvos['tp']
 
-                # CORREÇÃO 2: Risco dinâmico baseado na banca e no MAX_POSITION_RISK (4.5%)
+                # Risco dinâmico baseado na banca e no MAX_POSITION_RISK (4.5%)
                 banca_atual = getattr(Config, 'BANCA_DEMO_INICIAL', 100.0) + self.pnl_realizado_acumulado
                 risco_pct = getattr(Config, 'MAX_POSITION_RISK', 0.045)
                 risco_usd = banca_atual * risco_pct
@@ -196,7 +197,7 @@ class GerenciadorRiscoAutonomo:
                 if net_pnl < mon["min_pnl"]:
                     mon["min_pnl"] = net_pnl
 
-        # Acumula o PnL final no saldo da banca
+        # Acumula o PnL final no saldo da banca para fechamentos naturais da corretora
         symbols_para_remover = [s for s in self.posicoes_monitoradas if s not in symbols_ativos]
         for s in symbols_para_remover:
             pnl_fechamento = self.posicoes_monitoradas[s].get("last_net_pnl", 0.0)
@@ -215,6 +216,7 @@ class GerenciadorRiscoAutonomo:
             return
 
         pos_dict = {p.get('symbol'): p for p in positions if p.get('symbol')}
+        db_name = getattr(Config, 'DB_NAME', 'predador_v31.db')
 
         for symbol, mon in list(self.posicoes_monitoradas.items()):
             if symbol not in pos_dict:
@@ -247,19 +249,29 @@ class GerenciadorRiscoAutonomo:
                 
                 try:
                     close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
-                    await self.executor.execution.exchange.create_order(
-                        symbol=symbol,
-                        type='market',
-                        side=close_side,
-                        amount=qty,
-                        params={'reduceOnly': True}
-                    )
+                    if getattr(Config, 'OPERA_CONTA_REAL', False):
+                        await self.executor.execution.exchange.create_order(
+                            symbol=symbol,
+                            type='market',
+                            side=close_side,
+                            amount=qty,
+                            params={'reduceOnly': True}
+                        )
                 except Exception as e:
-                    logging.error(f"[{symbol}] Falha ao fechar posição a mercado via software: {e}")
+                    logging.error(f"[{symbol}] Falha ao fechar posição a mercado via corretora: {e}")
+                finally:
+                    # Deleção cirúrgica forçada no banco SQLite
+                    async with aiosqlite.connect(db_name, timeout=30) as db_conn:
+                        await db_conn.execute("DELETE FROM trades WHERE symbol = ?", (symbol,))
+                        await db_conn.commit()
                     
+                    self.pnl_realizado_acumulado += net_pnl
+                    if symbol in self.posicoes_monitoradas:
+                        del self.posicoes_monitoradas[symbol]
+                        
                 continue 
 
-            # CORREÇÃO 3: CATRACA DE SOFTWARE (Hard Stop Loss)
+            # --- CATRACA DE SOFTWARE (Hard Stop Loss) ---
             if pnl_em_r <= -1.0: 
                 msg = (
                     f"🚨 <b>STOP LOSS EXECUTADO (VIA SOFTWARE)</b>\n"
@@ -272,16 +284,26 @@ class GerenciadorRiscoAutonomo:
                 
                 try:
                     close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
-                    await self.executor.execution.exchange.create_order(
-                        symbol=symbol,
-                        type='market',
-                        side=close_side,
-                        amount=qty,
-                        params={'reduceOnly': True}
-                    )
+                    if getattr(Config, 'OPERA_CONTA_REAL', False):
+                        await self.executor.execution.exchange.create_order(
+                            symbol=symbol,
+                            type='market',
+                            side=close_side,
+                            amount=qty,
+                            params={'reduceOnly': True}
+                        )
                 except Exception as e:
-                    logging.error(f"[{symbol}] Falha ao executar Stop Loss a mercado via software: {e}")
+                    logging.error(f"[{symbol}] Falha ao executar Stop Loss a mercado via corretora: {e}")
+                finally:
+                    # Deleção cirúrgica forçada no banco SQLite
+                    async with aiosqlite.connect(db_name, timeout=30) as db_conn:
+                        await db_conn.execute("DELETE FROM trades WHERE symbol = ?", (symbol,))
+                        await db_conn.commit()
                     
+                    self.pnl_realizado_acumulado += net_pnl
+                    if symbol in self.posicoes_monitoradas:
+                        del self.posicoes_monitoradas[symbol]
+
                 continue 
 
             # --- GESTÃO DE BREAK-EVEN ---
@@ -347,7 +369,7 @@ class GerenciadorRiscoAutonomo:
                 f"• {symbol} | {mon.get('side', '?')} | PnL: ${net_pnl:+.2f} | {be_status}"
             )
 
-        modo_texto = "CONTA REAL ⚠️" if Config.OPERA_CONTA_REAL else "SIMULAÇÃO 🔬"
+        modo_texto = "CONTA REAL ⚠️" if getattr(Config, 'OPERA_CONTA_REAL', False) else "SIMULAÇÃO 🔬"
         banca_inicial = getattr(Config, 'BANCA_DEMO_INICIAL', 100.0)
         
         saldo_estimado = banca_inicial + self.pnl_realizado_acumulado + total_net_pnl
