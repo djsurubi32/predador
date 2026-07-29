@@ -30,6 +30,12 @@ class GerenciadorRiscoAutonomo:
         self.last_summary_time = time.time()
         self.pnl_realizado_acumulado = 0.0
 
+    @property
+    def saldo_atual(self) -> float:
+        """Calcula o saldo da banca em tempo real"""
+        banca_inicial = getattr(Config, 'BANCA_DEMO_INICIAL', 100.0)
+        return banca_inicial + self.pnl_realizado_acumulado
+
     def _calcular_risco_e_alvos(self, entry: float, sl: float, side: str) -> dict:
         if side.upper() in ['BUY', 'LONG']:
             risk_distance = abs(entry - sl)
@@ -54,12 +60,17 @@ class GerenciadorRiscoAutonomo:
 
             positions = await self.executor.execution.get_current_positions(self.db)
             max_trades = getattr(Config, 'MAX_OPEN_TRADES', 5)
-            if len(positions) >= max_trades:
-                return
-
             simbolos_abertos = [p.get('symbol') for p in positions]
 
+            # Trava de segurança inicial
+            if len(simbolos_abertos) >= max_trades:
+                return
+
             for sinal in sinais:
+                # Verificação rígida a cada iteração do loop para respeitar o limite exato
+                if len(simbolos_abertos) >= max_trades:
+                    break
+
                 symbol = sinal['symbol']
                 direction = sinal['direction']
                 entry = sinal['price']
@@ -82,10 +93,10 @@ class GerenciadorRiscoAutonomo:
                 alvos = self._calcular_risco_e_alvos(entry, sl, direction)
                 tp = alvos['tp']
 
-                # Risco dinâmico baseado na banca e no MAX_POSITION_RISK (4.5%)
-                banca_atual = getattr(Config, 'BANCA_DEMO_INICIAL', 100.0) + self.pnl_realizado_acumulado
+                # Risco dinâmico baseado no saldo real atualizado
+                banca_neste_momento = self.saldo_atual
                 risco_pct = getattr(Config, 'MAX_POSITION_RISK', 0.045)
-                risco_usd = banca_atual * risco_pct
+                risco_usd = banca_neste_momento * risco_pct
 
                 risk_distance_price = abs(entry - sl)
                 if risk_distance_price == 0:
@@ -113,13 +124,12 @@ class GerenciadorRiscoAutonomo:
                         f"Entrada: {entry:.5f}\n"
                         f"Take Profit (2R): {tp:.5f}\n"
                         f"Stop Loss (0.5%): {sl:.5f}\n"
-                        f"Score IA: {sinal.get('score', 0):.1f}/10"
+                        f"Score IA: {sinal.get('score', 0):.1f}/10\n"
+                        f"💰 Saldo da Banca: ${banca_neste_momento:.2f}"
                     )
                     await TelegramLogger.send(msg)
 
                     simbolos_abertos.append(symbol)
-                    if len(simbolos_abertos) >= max_trades:
-                        break 
 
             await self.db.clear_elite_signals()
 
@@ -141,12 +151,10 @@ class GerenciadorRiscoAutonomo:
                 continue
                 
             # --- QUARENTENA ANTI-LOOP (RACE CONDITION) ---
-            # Ignora moedas que mandamos fechar nos últimos 30s. A API da Bybit demora para limpar o cache.
             if symbol in self.fechamento_em_andamento:
                 if time.time() - self.fechamento_em_andamento[symbol] < 30:
                     continue 
                 else:
-                    # Passou 30s e a posição ainda existe? O fechamento falhou na corretora. Libera para tentar de novo.
                     del self.fechamento_em_andamento[symbol]
 
             symbols_ativos.add(symbol)
@@ -159,12 +167,11 @@ class GerenciadorRiscoAutonomo:
             net_pnl = float(p.get('netPnl', 0.0))
 
             if symbol not in self.posicoes_monitoradas:
-                # Fallback caso a corretora falhe em retornar o SL inicial
                 if current_sl <= 0:
                     if side in ['BUY', 'LONG']:
-                        current_sl = entry * 0.995 # SL de segurança 0.5%
+                        current_sl = entry * 0.995
                     else:
-                        current_sl = entry * 1.005 # SL de segurança 0.5%
+                        current_sl = entry * 1.005
 
                 alvos = self._calcular_risco_e_alvos(entry, current_sl, side)
 
@@ -213,7 +220,7 @@ class GerenciadorRiscoAutonomo:
         for s in symbols_para_remover:
             pnl_fechamento = self.posicoes_monitoradas[s].get("last_net_pnl", 0.0)
             self.pnl_realizado_acumulado += pnl_fechamento
-            logging.info(f"[{s}] Posição encerrada. PnL de ${pnl_fechamento:+.2f} transferido para o saldo da banca.")
+            logging.info(f"[{s}] Posição encerrada. PnL de ${pnl_fechamento:+.2f}. Novo Saldo: ${self.saldo_atual:.2f}")
             del self.posicoes_monitoradas[s]
 
     async def gerenciar_posicoes_2r(self):
@@ -249,26 +256,31 @@ class GerenciadorRiscoAutonomo:
 
             # --- CATRACA DE SOFTWARE (Hard Take Profit) ---
             if pnl_em_r >= 1.98:
-                self.fechamento_em_andamento[symbol] = time.time() # Trava para evitar loops
+                self.fechamento_em_andamento[symbol] = time.time()
+                
+                # Contabiliza PnL imediatamente antes de enviar a mensagem
+                self.pnl_realizado_acumulado += net_pnl
                 
                 msg = (
                     f"🏆 <b>ALVO 2R ATINGIDO (VIA SOFTWARE)</b>\n"
                     f"Moeda: {symbol}\n"
                     f"Lucro Final: ${net_pnl:+.2f} ({pnl_em_r:.2f}R)\n"
-                    f"Forçando fechamento a mercado para garantir o lucro."
+                    f"Forçando fechamento a mercado para garantir o lucro.\n"
+                    f"💰 Novo Saldo da Banca: ${self.saldo_atual:.2f}"
                 )
                 await TelegramLogger.send(msg)
-                logging.info(f"[{symbol}] PnL atingiu {pnl_em_r:.2f}R. Forçando fechamento a mercado.")
+                logging.info(f"[{symbol}] PnL atingiu {pnl_em_r:.2f}R. Fechamento forçado. Saldo atualizado.")
                 
                 try:
                     close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
-                    await self.executor.execution.exchange.create_order(
-                        symbol=symbol,
-                        type='market',
-                        side=close_side,
-                        amount=qty,
-                        params={'reduceOnly': True}
-                    )
+                    if getattr(Config, 'OPERA_CONTA_REAL', False):
+                        await self.executor.execution.exchange.create_order(
+                            symbol=symbol,
+                            type='market',
+                            side=close_side,
+                            amount=qty,
+                            params={'reduceOnly': True}
+                        )
                 except Exception as e:
                     logging.error(f"[{symbol}] Falha ao fechar posição a mercado na API: {e}")
                 finally:
@@ -277,7 +289,6 @@ class GerenciadorRiscoAutonomo:
                         await db_conn.execute("DELETE FROM trades WHERE symbol = ?", (symbol,))
                         await db_conn.commit()
                     
-                    self.pnl_realizado_acumulado += net_pnl
                     if symbol in self.posicoes_monitoradas:
                         del self.posicoes_monitoradas[symbol]
                         
@@ -285,26 +296,31 @@ class GerenciadorRiscoAutonomo:
 
             # --- CATRACA DE SOFTWARE (Hard Stop Loss) ---
             if pnl_em_r <= -1.0: 
-                self.fechamento_em_andamento[symbol] = time.time() # Trava para evitar loops
+                self.fechamento_em_andamento[symbol] = time.time()
+                
+                # Contabiliza PnL imediatamente antes de enviar a mensagem
+                self.pnl_realizado_acumulado += net_pnl
                 
                 msg = (
                     f"🚨 <b>STOP LOSS EXECUTADO (VIA SOFTWARE)</b>\n"
                     f"Moeda: {symbol}\n"
                     f"Prejuízo Cortado: ${net_pnl:+.2f} ({pnl_em_r:.2f}R)\n"
-                    f"A simulação falhou no SL físico. Proteção autônoma acionada na marra."
+                    f"Proteção autônoma acionada na marra.\n"
+                    f"💰 Novo Saldo da Banca: ${self.saldo_atual:.2f}"
                 )
                 await TelegramLogger.send(msg)
-                logging.error(f"[{symbol}] PnL atingiu {pnl_em_r:.2f}R. Cortando a operação perdedora a mercado!")
+                logging.error(f"[{symbol}] PnL atingiu {pnl_em_r:.2f}R. Posição cortada! Saldo atualizado.")
                 
                 try:
                     close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
-                    await self.executor.execution.exchange.create_order(
-                        symbol=symbol,
-                        type='market',
-                        side=close_side,
-                        amount=qty,
-                        params={'reduceOnly': True}
-                    )
+                    if getattr(Config, 'OPERA_CONTA_REAL', False):
+                        await self.executor.execution.exchange.create_order(
+                            symbol=symbol,
+                            type='market',
+                            side=close_side,
+                            amount=qty,
+                            params={'reduceOnly': True}
+                        )
                 except Exception as e:
                     logging.error(f"[{symbol}] Falha ao executar Stop Loss a mercado na API: {e}")
                 finally:
@@ -313,7 +329,6 @@ class GerenciadorRiscoAutonomo:
                         await db_conn.execute("DELETE FROM trades WHERE symbol = ?", (symbol,))
                         await db_conn.commit()
                     
-                    self.pnl_realizado_acumulado += net_pnl
                     if symbol in self.posicoes_monitoradas:
                         del self.posicoes_monitoradas[symbol]
 
@@ -383,15 +398,13 @@ class GerenciadorRiscoAutonomo:
             )
 
         modo_texto = "CONTA REAL ⚠️" if getattr(Config, 'OPERA_CONTA_REAL', False) else "SIMULAÇÃO 🔬"
-        banca_inicial = getattr(Config, 'BANCA_DEMO_INICIAL', 100.0)
-        
-        saldo_estimado = banca_inicial + self.pnl_realizado_acumulado + total_net_pnl
+        saldo_estimado = self.saldo_atual + total_net_pnl
 
         resumo = (
             f"⏱️ <b>RAIO-X DAS POSIÇÕES (10 min)</b> [{modo_texto}]\n\n"
             f"🔹 Posições Ativas: {len(positions)}\n"
             f"🔹 PnL Flutuante Total: ${total_net_pnl:+.2f}\n"
-            f"🔹 Saldo Estimado: ${saldo_estimado:.2f}\n\n"
+            f"🔹 Saldo Total Estimado: ${saldo_estimado:.2f}\n\n"
             f"<b>Detalhamento:</b>\n" + "\n".join(linhas)
         )
         await TelegramLogger.send(resumo)
@@ -399,6 +412,7 @@ class GerenciadorRiscoAutonomo:
 
     async def loop_agente_autonomo(self):
         logging.info("🧠 GERENCIADOR DE RISCO 2:1 ONLINE — Módulo de Abertura e Gestão Ativos")
+        logging.info(f"💰 Saldo da Banca Inicializado: ${self.saldo_atual:.2f}")
         
         while True:
             try:
