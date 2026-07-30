@@ -5,10 +5,13 @@ import sys
 import time
 import psutil
 
-# Importação dos nossos microserviços isolados
+# Importação dos microserviços isolados
 from treinador import main as treinador_main
 from analisador import RadarCore
 from gerenciador import GerenciadorRiscoAutonomo
+from radar_pares import RadarArbitragem
+from treinador_arbitragem import TreinadorArbitragem
+from config import Config
 
 # Configuração do Orquestrador
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [MAESTRO] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -17,21 +20,42 @@ def verificar_uso_ram():
     """Retorna o percentual de uso da memória RAM da VPS."""
     return psutil.virtual_memory().percent
 
-def run_treinador():
-    """Microserviço 1: Forja de Inteligência Artificial (Heavy CPU)"""
-    logging.info("🧠 Iniciando microserviço: TREINADOR (Machine Learning)")
+def run_treinadores_sequenciais():
+    """Microserviço 1: Esteira de Inteligência Artificial (Heavy CPU - Sequencial)"""
+    logging.info("🧠 Iniciando microserviço: TREINADORES (Direcional -> Arbitragem)")
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    async def esteira():
+        while True:
+            logging.info("🔄 [ESTEIRA] Fase 1: Iniciando Treinamento Direcional...")
+            try:
+                # Importante: O treinador_main() não pode ter um "while True" infinito dentro dele,
+                # ele deve executar um ciclo completo de treino e finalizar para liberar a fila.
+                await treinador_main()
+            except Exception as e:
+                logging.error(f"❌ Erro no Treinador Direcional: {e}")
+            
+            logging.info("🔄 [ESTEIRA] Fase 2: Iniciando Treinamento de Arbitragem...")
+            try:
+                treinador_arb = TreinadorArbitragem(dias_historico=Config.ARB_DIAS_HISTORICO)
+                await treinador_arb.executar_pipeline()
+            except Exception as e:
+                logging.error(f"❌ Erro no Treinador de Arbitragem: {e}")
+            
+            horas = getattr(Config, 'HORAS_RETREINO', 24)
+            logging.info(f"💤 [ESTEIRA] Ciclo completo. Hibernando por {horas} horas...")
+            await asyncio.sleep(horas * 3600)
+
     try:
-        # CORREÇÃO: Agora o maestro sabe que o Treinador é um motor assíncrono
-        asyncio.run(treinador_main())
+        asyncio.run(esteira())
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        logging.error(f"❌ Falha fatal no Treinador: {e}")
+        logging.error(f"❌ Falha fatal na Esteira de Treinadores: {e}")
 
 def run_analisador():
-    """Microserviço 2: Radar de Mercado (Heavy I/O)"""
+    """Microserviço 2: Radar de Mercado Direcional (Heavy I/O)"""
     logging.info("📡 Iniciando microserviço: ANALISADOR (Radar Quantitativo)")
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -43,13 +67,25 @@ def run_analisador():
     except Exception as e:
         logging.error(f"❌ Falha fatal no Analisador: {e}")
 
-def run_gerenciador():
-    """Microserviço 3: Cérebro de Risco e Execução (Latência Zero)"""
-    logging.info("🛡️ Iniciando microserviço: GERENCIADOR (Agente Autônomo e Catraca)")
+def run_radar_arbitragem():
+    """Microserviço 3: Radar de Mercado Neutro (Pairs Trading)"""
+    logging.info("⚖️ Iniciando microserviço: RADAR ARBITRAGEM")
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
-        # O Gerenciador já importa e instancia o executor.py internamente
+        radar_arb = RadarArbitragem()
+        asyncio.run(radar_arb.iniciar_varredura())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logging.error(f"❌ Falha fatal no Radar de Arbitragem: {e}")
+
+def run_gerenciador():
+    """Microserviço 4: Cérebro de Risco e Execução Híbrida (Latência Zero)"""
+    logging.info("🛡️ Iniciando microserviço: GERENCIADOR HÍBRIDO")
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
         gerenciador = GerenciadorRiscoAutonomo()
         asyncio.run(gerenciador.loop_agente_autonomo())
     except KeyboardInterrupt:
@@ -59,65 +95,75 @@ def run_gerenciador():
 
 if __name__ == '__main__':
     logging.info("===============================================================")
-    logging.info("🚀 SISTEMA PREDADOR QUANTITATIVO V2.0 (ARQUITETURA DISTRIBUÍDA)")
+    logging.info("🚀 SISTEMA PREDADOR QUANTITATIVO V3.1 (HÍBRIDO & DISTRIBUÍDO)")
     logging.info("===============================================================")
 
-    # Criação dos processos independentes (Isolamento de Memória e CPU)
-    p_treinador = multiprocessing.Process(target=run_treinador, name="Processo-Treinador")
+    # Criação dos processos independentes
+    p_treinadores = multiprocessing.Process(target=run_treinadores_sequenciais, name="Processo-Treinadores")
     p_analisador = multiprocessing.Process(target=run_analisador, name="Processo-Analisador")
+    p_radar_arb = multiprocessing.Process(target=run_radar_arbitragem, name="Processo-Radar-Arbitragem")
     p_gerenciador = multiprocessing.Process(target=run_gerenciador, name="Processo-Gerenciador")
 
-    # Ordem de ignição faseada para suportar picos de memória da VPS
-    logging.info("⏳ Ligando Analisador primeiro para absorver o pico de RAM da IA de NLP...")
+    # Ordem de ignição faseada
+    logging.info("⏳ Ligando Analisador Direcional e Radar de Arbitragem...")
     p_analisador.start()
-    time.sleep(20)  # Dá 20 segundos para a IA estabilizar na memória
+    p_radar_arb.start()
+    time.sleep(20) 
 
     p_gerenciador.start()
-    time.sleep(5)  # Estabilização rápida
+    time.sleep(5) 
 
     uso_ram = verificar_uso_ram()
     if uso_ram < 85.0:
-        logging.info(f"📊 RAM estável ({uso_ram}%). Iniciando Treinador...")
-        p_treinador.start()
+        logging.info(f"📊 RAM estável ({uso_ram}%). Iniciando Esteira de Treinadores...")
+        p_treinadores.start()
     else:
-        logging.warning(f"⚠️ RAM crítica na VPS ({uso_ram}%). O Treinador aguardará alívio para iniciar.")
+        logging.warning(f"⚠️ RAM crítica na VPS ({uso_ram}%). A Esteira aguardará alívio para iniciar.")
 
     try:
-        # O Maestro atua como cão de guarda, reiniciando automaticamente processos mortos
+        # Cão de guarda (Watchdog)
         while True:
             time.sleep(30)
 
             if not p_analisador.is_alive():
-                logging.warning("⚠️ Alerta: O processo ANALISADOR caiu. Reiniciando de forma autônoma...")
+                logging.warning("⚠️ O processo ANALISADOR caiu. Reiniciando...")
                 p_analisador = multiprocessing.Process(target=run_analisador, name="Processo-Analisador")
                 p_analisador.start()
-                time.sleep(20)
+                time.sleep(10)
+
+            if not p_radar_arb.is_alive():
+                logging.warning("⚠️ O processo RADAR ARBITRAGEM caiu. Reiniciando...")
+                p_radar_arb = multiprocessing.Process(target=run_radar_arbitragem, name="Processo-Radar-Arbitragem")
+                p_radar_arb.start()
+                time.sleep(10)
 
             if not p_gerenciador.is_alive():
-                logging.warning("⚠️ Alerta: O processo GERENCIADOR caiu. Reiniciando de forma autônoma...")
+                logging.warning("⚠️ O processo GERENCIADOR caiu. Reiniciando...")
                 p_gerenciador = multiprocessing.Process(target=run_gerenciador, name="Processo-Gerenciador")
                 p_gerenciador.start()
                 time.sleep(5)
 
-            if not p_treinador.is_alive():
+            if not p_treinadores.is_alive():
                 uso_ram = verificar_uso_ram()
                 if uso_ram < 85.0:
-                    logging.warning(f"⚠️ O processo TREINADOR caiu ou estava na fila. RAM em {uso_ram}%. (Re)iniciando...")
-                    p_treinador = multiprocessing.Process(target=run_treinador, name="Processo-Treinador")
-                    p_treinador.start()
+                    logging.warning(f"⚠️ O processo TREINADORES caiu/fila. RAM em {uso_ram}%. (Re)iniciando...")
+                    p_treinadores = multiprocessing.Process(target=run_treinadores_sequenciais, name="Processo-Treinadores")
+                    p_treinadores.start()
                 else:
-                    logging.warning(f"⚠️ TREINADOR inativo. Aguardando alívio de RAM (Atual: {uso_ram}%) para não travar a VPS.")
+                    logging.warning(f"⚠️ TREINADORES inativo. RAM crítica ({uso_ram}%).")
 
     except KeyboardInterrupt:
-        # Morte Limpa (Graceful Shutdown) caso prima Ctrl+C no terminal
+        # Morte Limpa
         logging.info("🛑 Comando de paragem recebido. A desligar todos os motores de forma segura...")
 
-        if p_treinador.is_alive(): p_treinador.terminate()
+        if p_treinadores.is_alive(): p_treinadores.terminate()
         if p_analisador.is_alive(): p_analisador.terminate()
+        if p_radar_arb.is_alive(): p_radar_arb.terminate()
         if p_gerenciador.is_alive(): p_gerenciador.terminate()
 
-        p_treinador.join()
+        p_treinadores.join()
         p_analisador.join()
+        p_radar_arb.join()
         p_gerenciador.join()
 
         logging.info("✅ Sistema integralmente encerrado.")

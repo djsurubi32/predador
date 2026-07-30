@@ -26,6 +26,22 @@ class BotConfig(BaseSettings):
     BANCA_DEMO_INICIAL: float = Field(default=100.0)
 
     # ---------------------------------------------------------
+    # MÓDULO DE ARBITRAGEM ESTATÍSTICA (PAIRS TRADING & IA)
+    # ---------------------------------------------------------
+    ARB_MODELOS_DIR: str = Field(default="modelos_arbitragem")
+    ARB_DIAS_HISTORICO: int = Field(default=30)                  # Janela de 30 dias para capturar regimes atuais
+    ARB_P_VALUE_THRESHOLD: float = Field(default=0.05)           # Nível de 95% de confiança na Cointegração do par
+    ARB_MAX_PARES_ATIVOS: int = Field(default=5)                 # Limite de pares (10 ordens simultâneas no total)
+    
+    # Parâmetros do Motor de Clustering (Fase 1)
+    ARB_DBSCAN_EPS: float = Field(default=0.5)                   # Distância máxima de correlação no espaço vetorial
+    ARB_DBSCAN_MIN_SAMPLES: int = Field(default=2)               # Mínimo de 2 moedas para consolidar um grupo
+    
+    # Gerenciamento de Risco Isolado da Arbitragem
+    ARB_MAX_PORTFOLIO_RISK: float = Field(default=0.04, le=0.15) # Risco máximo global dedicado apenas à arbitragem
+    ARB_MAX_POSITION_RISK: float = Field(default=0.01, le=0.05)  # Risco máximo por par (engloba as pernas Long e Short)
+
+    # ---------------------------------------------------------
     # KILL SWITCH & SOBREVIVÊNCIA (Circuit Breakers)
     # ---------------------------------------------------------
     MAX_DAILY_DRAWDOWN: float = Field(default=0.05, le=0.10)     # Para operações se equity cair 5% no dia
@@ -36,7 +52,7 @@ class BotConfig(BaseSettings):
     SLIPPAGE_BPS_ESTIMATE: int = Field(default=3)                # Derrapagem estimada de 3 basis points (0.03%)
 
     # ---------------------------------------------------------
-    # GERENCIAMENTO DE RISCO E DIMENSIONAMENTO (PORTFÓLIO)
+    # GERENCIAMENTO DE RISCO E DIMENSIONAMENTO (PORTFÓLIO DIRECIONAL)
     # ---------------------------------------------------------
     MAX_PORTFOLIO_RISK: float = Field(default=0.06, le=0.20)
     MAX_POSITION_RISK: float = Field(default=0.01, le=0.05)
@@ -64,7 +80,7 @@ class BotConfig(BaseSettings):
     # ---------------------------------------------------------
     # BARREIRAS DE TREINAMENTO E MACHINE LEARNING
     # ---------------------------------------------------------
-    BARRIER_HORIZON: int = Field(default=12)                     # Horizonte de 1 hora no 5m
+    BARRIER_HORIZON: int = Field(default=36)                     # Horizonte de 1 hora no 5m
     TP_ATR_MULT: float = Field(default=2.0)
     SL_ATR_MULT: float = Field(default=1.0)
 
@@ -89,7 +105,11 @@ class BotConfig(BaseSettings):
             raise ValueError("CRÍTICO: OPERA_CONTA_REAL=True ativado, mas as chaves de API estão vazias.")
 
         if (self.MAX_OPEN_TRADES * self.MAX_POSITION_RISK) > self.MAX_PORTFOLIO_RISK:
-            raise ValueError("CRÍTICO: O risco máximo por trade (vezes limite posições) estoura o teto do portfólio.")
+            raise ValueError("CRÍTICO: O risco máximo por trade (vezes limite posições) estoura o teto do portfólio direcional.")
+            
+        # NOVA VALIDAÇÃO PARA ARBITRAGEM
+        if (self.ARB_MAX_PARES_ATIVOS * self.ARB_MAX_POSITION_RISK) > self.ARB_MAX_PORTFOLIO_RISK:
+            raise ValueError("CRÍTICO: O risco da arbitragem alocado supera o limite permitido (ARB_MAX_PORTFOLIO_RISK).")
 
         custo_total_estimado_pct = (self.TAKER_FEE_PCT * 2) + (self.SLIPPAGE_BPS_ESTIMATE / 100)
         if self.MIN_EXPECTED_MOVE_PCT <= (custo_total_estimado_pct * 1.5):
@@ -99,8 +119,14 @@ class BotConfig(BaseSettings):
 
 Config = BotConfig()
 
+# ---------------------------------------------------------
+# CRIAÇÃO AUTOMÁTICA DE DIRETÓRIOS
+# ---------------------------------------------------------
 if not os.path.exists(Config.MODELS_DIR):
     os.makedirs(Config.MODELS_DIR)
+
+if not os.path.exists(Config.ARB_MODELOS_DIR):
+    os.makedirs(Config.ARB_MODELOS_DIR)
 
 class UniverseProvider:
     def __init__(self, ttl: int = 300):
