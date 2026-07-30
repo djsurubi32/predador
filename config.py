@@ -39,7 +39,7 @@ class BotConfig(BaseSettings):
     
     # Gerenciamento de Risco Isolado da Arbitragem
     ARB_MAX_PORTFOLIO_RISK: float = Field(default=0.04, le=0.15) # Risco máximo global dedicado apenas à arbitragem
-    ARB_MAX_POSITION_RISK: float = Field(default=0.01, le=0.05)  # Risco máximo por par (engloba as pernas Long e Short)
+    ARB_MAX_POSITION_RISK: float = Field(default=0.08, le=0.20)  # Risco máximo por par (engloba as pernas Long e Short)
 
     # ---------------------------------------------------------
     # KILL SWITCH & SOBREVIVÊNCIA (Circuit Breakers)
