@@ -54,7 +54,7 @@ class BotConfig(BaseSettings):
     # ---------------------------------------------------------
     # GERENCIAMENTO DE RISCO E DIMENSIONAMENTO (PORTFÓLIO DIRECIONAL)
     # ---------------------------------------------------------
-    MAX_PORTFOLIO_RISK: float = Field(default=0.06, le=0.20)
+    MAX_PORTFOLIO_RISK: float = Field(default=0.04, le=0.15)
     MAX_POSITION_RISK: float = Field(default=0.01, le=0.05)
     MAX_LEVERAGE_TOTAL: float = Field(default=3.0)
     MAX_CORRELATED_EXPOSURE: float = Field(default=0.03)
