@@ -58,7 +58,7 @@ class BotConfig(BaseSettings):
     MAX_POSITION_RISK: float = Field(default=0.01, le=0.05)
     MAX_LEVERAGE_TOTAL: float = Field(default=3.0)
     MAX_CORRELATED_EXPOSURE: float = Field(default=0.03)
-    MAX_OPEN_TRADES: int = Field(default=5)
+    MAX_OPEN_TRADES: int = Field(default=3)
 
     # Barreiras do Analisador (Corte Dinâmico)
     MIN_SCORE_ENTRY: float = Field(default=5.0)
