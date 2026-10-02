@@ -1,434 +1,437 @@
+"""
+treinador.py — Motor de treinamento do Predador v3.2.
+
+FLUXO POR SIMBOLO:
+    1. Baixa OHLCV 5m + Open Interest + Funding (Bybit, ~100k velas)
+    2. Monta benchmark BTC real
+    3. features.adicionar_features() — MESMO pipeline da inferencia
+    4. HMM fit somente no treino (sem leakage de regime)
+    5. rotulador.rotular() — barreira +/-BARRIER_PCT nas proximas 2 velas
+    6. Split temporal com embargo (purged)
+    7. Stacking: LGBM + XGB + CatBoost -> RandomForest meta
+    8. Calibracao de probabilidade (o gate de 65% so funciona calibrado)
+    9. Persiste .pkl com o contrato do analisador
+
+CONTRATO DO .pkl (consumido pelo analisador.py):
+    payload = {
+        "modelo":          estimator com predict_proba (calibrado),
+        "feature_names":   lista de colunas na ordem exata do treino,
+        "hmm":             modelo HMM treinado (para regime na inferencia),
+        "symbol":          "BTC/USDT:USDT",
+        "barrier_pct":     0.20,
+        "label_horizon":   2,
+        "timeframe":       "5m",
+        "metrics":         dict com logloss/brier/gate/cobertura/expectativa,
+        "trained_at":      timestamp,
+    }
+"""
+
 import os
+import gc
 import time
 import logging
 import warnings
 import asyncio
 import joblib
-import gc
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-import ccxt.async_support as ccxt_async
-import pandas as pd
 import numpy as np
-from hmmlearn.hmm import GaussianHMM
+import pandas as pd
+import ccxt.async_support as ccxt_async
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
-# Importando o novo Meta-Modelo (Random Forest)
+from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import log_loss, brier_score_loss
 
-# Importamos o Config e o novo universe_provider assíncrono
 from config import Config, universe_provider
-from ta_indicators import add_custom_ta
+from features import (
+    adicionar_features,
+    aplicar_regime_hmm,
+    FEATURE_NAMES,
+    HMM_INPUTS,
+)
+from rotulador import rotular, estatisticas_rotulo
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - [TREINADOR] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s - [TREINADOR] - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logging.getLogger("hmmlearn").setLevel(logging.ERROR)
 
+TF_SECONDS = {"5m": 300, "1m": 60, "15m": 900, "1h": 3600}
+
+MIN_VELAS_ROTULADAS = 500       # abaixo disso, simbolo nao gera modelo
+GATE_AVALIACAO = Config.MIN_PROB_ENTRY  # 65.0
+
+
 class DummyHMM:
+    """Fallback se o HMM nao convergir."""
     def predict(self, X):
-        return np.zeros(len(X))
+        return np.zeros(len(X), dtype=int)
 
-def apply_triple_barrier(df):
+
+class CalibratedStackingEnsemble:
     """
-    Barreira Tripla Dinâmica baseada em ATR consumindo variáveis do config.py.
+    Pipeline completo do Stacking:
+    Recebe as features brutas (49 colunas), extrai as probabilidades dos modelos
+    base (LGBM + XGB + CatBoost) e as submete ao calibrador isotonico.
     """
-    horizon = getattr(Config, 'BARRIER_HORIZON', 16)
-    tp_atr_mult = getattr(Config, 'TP_ATR_MULT', 2.0)
-    sl_atr_mult = getattr(Config, 'SL_ATR_MULT', 1.5)
+    def __init__(self, lgbm, xgbm, catb, calibrator):
+        self.lgbm = lgbm
+        self.xgbm = xgbm
+        self.catb = catb
+        self.calibrator = calibrator
 
-    targets = np.full(len(df), np.nan)
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
+    def predict_proba(self, X):
+        X_stack = np.column_stack([
+            self.lgbm.predict_proba(X),
+            self.xgbm.predict_proba(X),
+            self.catb.predict_proba(X),
+        ])
+        return self.calibrator.predict_proba(X_stack)
 
-    if 'ATRr_14' in df.columns:
-        atr = df['ATRr_14'].bfill().values
-    else:
-        closes_shifted = np.roll(closes, 1)
-        closes_shifted[0] = closes[0]
 
-        tr = np.maximum(highs - lows,
-             np.maximum(abs(highs - closes_shifted),
-                        abs(lows - closes_shifted)))
+# =====================================================================
+# FETCH DE DADOS (OHLCV + OI + Funding) — Bybit publica/testnet
+# =====================================================================
+async def fetch_historico_completo(exchange, symbol: str, limit: int) -> list:
+    """
+    Retorna lista de barras [ts, o, h, l, c, v, open_interest, funding].
+    OI e funding sao alinhados por timestamp (forward-fill entre amostras).
+    """
+    try:
+        tf_sec = TF_SECONDS.get(Config.TIMEFRAME, 300)
+        todas = []
+        since_ms = int((time.time() - (limit * tf_sec)) * 1000)
 
-        atr = pd.Series(tr).rolling(window=14).mean().bfill().values
-
-    for i in range(len(df) - horizon):
-        entry = closes[i]
-        current_atr = atr[i]
-
-        tp = entry + (current_atr * tp_atr_mult)
-        sl = entry - (current_atr * sl_atr_mult)
-
-        for j in range(1, horizon + 1):
-            if highs[i + j] >= tp:
-                targets[i] = 1  
+        while len(todas) < limit:
+            lote = await exchange.fetch_ohlcv(
+                symbol, Config.TIMEFRAME, since=since_ms, limit=1000
+            )
+            if not lote:
                 break
-            elif lows[i + j] <= sl:
-                targets[i] = 2  
+            since_ms = lote[-1][0] + 1
+            todas.extend(lote)
+            if len(lote) < 1000:
                 break
+        todas = todas[-limit:]
+        if len(todas) < 1000:
+            return []
 
-        if np.isnan(targets[i]):
-            targets[i] = 0  
+        # ---- Open Interest ----
+        oi_map = {}
+        try:
+            oi_data = await exchange.fetch_open_interest_history(
+                symbol, Config.TIMEFRAME, limit=min(1000, limit)
+            )
+            for item in oi_data:
+                ts = int(item.get("timestamp", 0))
+                val = float(
+                    item.get("openInterestValue")
+                    or (item.get("info", {}) or {}).get("openInterest", 0)
+                    or 0
+                )
+                if val > 0:
+                    oi_map[ts] = val
+        except Exception as e:
+            logging.debug(f"OI indisponivel {symbol}: {e}")
 
-    df['target'] = targets
-    return df
+        # ---- Funding Rate ----
+        fr_map = {}
+        try:
+            fr_data = await exchange.fetch_funding_rate_history(
+                symbol, limit=min(1000, limit)
+            )
+            for item in fr_data:
+                ts = int(item.get("timestamp", 0))
+                fr_map[ts] = float(item.get("fundingRate", 0) or 0)
+        except Exception as e:
+            logging.debug(f"Funding indisponivel {symbol}: {e}")
 
-def prepare_features(df, btc_df=None):
-    df = add_custom_ta(df)
+        # ---- Merge forward-fill ----
+        merged = []
+        last_oi, last_fr = 0.0, 0.0
+        for bar in todas:
+            ts = int(bar[0])
+            if oi_map.get(ts, 0.0) != 0.0:
+                last_oi = oi_map[ts]
+            if ts in fr_map:
+                last_fr = fr_map[ts]
+            merged.append(
+                [bar[0], bar[1], bar[2], bar[3], bar[4], bar[5], last_oi, last_fr]
+            )
+        return merged
 
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD_12_26_9'] = ema12 - ema26
-    df['SMA_ATR_100'] = df['ATRr_14'].rolling(window=100).mean() if 'ATRr_14' in df.columns else 0.0
+    except Exception as e:
+        logging.error(f"Erro ao baixar {symbol}: {e}")
+        return []
 
-    numeric_cols = df.columns
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-    df.ffill(inplace=True)
-    df.fillna(0.0, inplace=True)
 
-    ema5 = df['close'].ewm(span=5, adjust=False).mean()
-    df['close_smooth'] = ema5.ewm(span=5, adjust=False).mean()
+# =====================================================================
+# NUCLEO DE TREINO (CPU-bound — roda em thread pool)
+# =====================================================================
+def treinar_simbolo(symbol: str, bars: list, btc_bars: list) -> str:
+    if len(bars) < 2000:
+        return f"PULADO {symbol}: apenas {len(bars)} barras."
 
-    df['noise_index'] = (abs(df['close'] - df['close_smooth']) / (df['close'] + 1e-9)).fillna(0.0)
-    df['log_return'] = np.log(df['close'] / df['close'].shift(1).replace(0, 1e-9))
-    df['volatility_cluster'] = df['log_return'].rolling(window=20).std()
+    df = pd.DataFrame(
+        bars,
+        columns=["timestamp", "open", "high", "low", "close",
+                 "volume", "open_interest", "funding_rate"],
+    )
+    btc_df = (
+        pd.DataFrame(btc_bars, columns=["timestamp", "open", "high", "low",
+                                        "close", "volume", "open_interest", "funding_rate"])
+        if btc_bars else None
+    )
 
-    vol_roll = df['volume'].rolling(20)
-    df['vol_zscore'] = (df['volume'] - vol_roll.mean()) / (vol_roll.std() + 1e-9)
+    # ---- Features (pipeline unico) ----
+    try:
+        df_feat = adicionar_features(df, btc_df[["timestamp", "close"]] if btc_df is not None else None)
+    except ValueError as e:
+        return f"PULADO {symbol}: {e}"
 
-    if 'EMA_20' not in df.columns:
-        df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['price_vs_ema'] = df['close'] - df['EMA_20']
+    # ---- Rotulos ----
+    try:
+        y = rotular(df_feat["close"], df_feat["high"], df_feat["low"])
+    except ValueError as e:
+        return f"PULADO {symbol}: {e}"
 
-    bbl = df.get('BBL_20_2.0', df['close'])
-    bbu = df.get('BBU_20_2.0', df['close'])
-    df['bb_pos'] = (df['close'] - bbl) / (bbu - bbl + 1e-9)
+    stats = estatisticas_rotulo(y, symbol)
+    if stats["rotuladas"] < MIN_VELAS_ROTULADAS:
+        return (
+            f"PULADO {symbol}: so {stats['rotuladas']} velas rotuladas "
+            f"(minimo {MIN_VELAS_ROTULADAS})."
+        )
 
-    df['rsi_slope'] = df.get('RSI_14', pd.Series(0, index=df.index)).diff(3)
-    df['price_slope'] = df['close_smooth'].diff(3).fillna(0.0)
-    df['rsi_divergence'] = np.where((df['price_slope'] < 0) & (df['rsi_slope'] > 0), 1,
-                           np.where((df['price_slope'] > 0) & (df['rsi_slope'] < 0), -1, 0))
+    df_t = df_feat.loc[y.index].copy()
+    yy = y.loc[df_t.index]
 
-    df['candle_dir'] = np.where(df['close'] >= df['open'], 1, -1)
-    df['cvd'] = (df['volume'] * df['candle_dir']).cumsum()
-    df['cvd_trend'] = df['cvd'] - df['cvd'].rolling(20).mean()
+    if len(np.unique(yy)) < 2:
+        return f"PULADO {symbol}: rotulo sem contraste (so uma classe)."
 
-    if 'open_interest' in df.columns:
-        df['oi_temp'] = df['open_interest'].replace(0, np.nan).ffill().bfill()
-        df['oi_change'] = df['oi_temp'].pct_change(fill_method=None).fillna(0.0)
-        df['oi_trend'] = df['oi_change'].rolling(window=5).mean().fillna(0.0)
-        price_pct = df['close'].pct_change(fill_method=None).fillna(0.0)
+    # ---- Split temporal com embargo (purged pelo horizonte do rotulo) ----
+    n = len(df_t)
+    embargo = max(Config.LABEL_HORIZON_CANDLES + 1,
+                  int(n * Config.PURGED_CV_EMBARGO_PCT))
+    corte_meta = int(n * 0.75)   # 75% treino | 12.5% meta | 12.5% calibracao
+    corte_cal = int(n * 0.875)
 
-        df['oi_price_divergence'] = np.where((price_pct > 0) & (df['oi_change'] > 0), 1.0,
-                                    np.where((price_pct < 0) & (df['oi_change'] > 0), -1.0,
-                                    np.where((price_pct > 0) & (df['oi_change'] < 0), -0.5,
-                                    np.where((price_pct < 0) & (df['oi_change'] < 0), 0.5, 0.0))))
-        df.drop(columns=['oi_temp'], inplace=True)
-        df['oi_momentum'] = (df['open_interest'].diff(5) / (df['open_interest'].rolling(20).mean() + 1e-9)).fillna(0.0)
-    else:
-        df['oi_change'], df['oi_trend'], df['oi_price_divergence'], df['oi_momentum'] = 0.0, 0.0, 0.0, 0.0
+    if corte_meta - embargo < 500 or (n - corte_cal) < 200:
+        return f"PULADO {symbol}: historico insuficiente para os 3 blocos."
 
-    df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
-    df['obv_slope'] = df['obv'].diff(3).fillna(0.0)
-    df['obv_rsi_div'] = np.where((df['obv_slope'] > 0) & (df['rsi_slope'] < 0), 1.0,
-                        np.where((df['obv_slope'] < 0) & (df['rsi_slope'] > 0), -1.0, 0.0))
+    df_train = df_t.iloc[: corte_meta - embargo]
+    y_train = yy.iloc[: corte_meta - embargo]
+    df_meta = df_t.iloc[corte_meta:corte_cal]
+    y_meta = yy.iloc[corte_meta:corte_cal]
+    df_cal = df_t.iloc[corte_cal:]
+    y_cal = yy.iloc[corte_cal:]
 
-    df['cvd_accel'] = df['cvd'].diff(3).diff(3).fillna(0.0)
-
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-    
-    typical_price = (df['high'] + df['low'] + df['close']) / 3
-    df['vol_price'] = df['volume'] * typical_price
-    df['date_only'] = df['datetime'].dt.date
-    df['cum_vol_price'] = df.groupby('date_only')['vol_price'].cumsum()
-    df['cum_vol'] = df.groupby('date_only')['volume'].cumsum()
-    df['vwap'] = df['cum_vol_price'] / (df['cum_vol'] + 1e-9)
-    df['vwap_dist'] = ((df['close'] - df['vwap']) / (df['vwap'] + 1e-9)).fillna(0.0)
-
-    df['liq_vacuum'] = ((df['high'] - df['low']) / (df['volume'] + 1e-9)).rolling(10).mean().fillna(0.0)
-
-    if 'funding_rate' in df.columns:
-        df['funding_rate'] = df['funding_rate'].replace(0, np.nan).ffill().fillna(0.0)
-        df['funding_rate_delta'] = df['funding_rate'].diff(3).fillna(0.0)
-    else:
-        df['funding_rate_delta'] = 0.0
-
-    vol_drop = df['volume'] < df['volume'].shift(1)
-    roc = df['close'].pct_change().fillna(0.0)
-    df['nvi'] = (vol_drop * roc).cumsum().fillna(0.0)
-
-    lag1_var = df['log_return'].rolling(20).var().fillna(0.0)
-    lag5_var = df['close'].pct_change(5).rolling(20).var().fillna(0.0)
-    df['hurst_proxy'] = (np.log(lag5_var + 1e-9) / np.log(lag1_var + 1e-9)).fillna(0.0)
-
-    roll50 = df['close'].rolling(50)
-    df['z_score_50'] = ((df['close'] - roll50.mean()) / (roll50.std() + 1e-9)).fillna(0.0)
-    
-    df['autocorr_3'] = df['log_return'].rolling(20).apply(lambda x: x.autocorr(lag=3) if len(x) >= 4 else 0, raw=False).fillna(0.0)
-
-    n_period = 20
-    high_max = df['high'].rolling(n_period).max()
-    low_min = df['low'].rolling(n_period).min()
-    path_length = np.abs(df['close'].diff()).rolling(n_period).sum()
-    df['fractal_dim'] = (np.log(path_length + 1e-9) / np.log((high_max - low_min) + 1e-9)).fillna(0.0)
-
-    atr_14 = df.get('ATRr_14', df['close'].rolling(14).std())
-    kc_upper = df['EMA_20'] + (1.5 * atr_14)
-    kc_lower = df['EMA_20'] - (1.5 * atr_14)
-    df['squeeze_ratio'] = ((bbu - bbl) / (kc_upper - kc_lower + 1e-9)).fillna(1.0)
-
-    df['natr'] = ((atr_14 / df['close']) * 100).fillna(0.0)
-    df['skewness_20'] = df['log_return'].rolling(20).skew().fillna(0.0)
-
-    ema9_macd = df['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
-    df['macd_hist_vel'] = (df['MACD_12_26_9'] - ema9_macd).diff(2).fillna(0.0)
-
-    cols_to_drop = ['vol_price', 'date_only', 'cum_vol_price', 'cum_vol', 'vwap', 'obv', 'obv_slope']
-    df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True, errors='ignore')
-
-    df_indexed = df.set_index('datetime')
-    df_1h = df_indexed['close'].resample('1h').last().to_frame(name='close_1h').ffill()
-    df_1h['ema_20_1h'] = df_1h['close_1h'].ewm(span=20, adjust=False).mean()
-    df_4h = df_indexed['close'].resample('4h').last().to_frame(name='close_4h').ffill()
-    df_4h['ema_20_4h'] = df_4h['close_4h'].ewm(span=20, adjust=False).mean()
-
-    df_indexed = df_indexed.join(df_1h[['ema_20_1h']], how='left').ffill()
-    df_indexed = df_indexed.join(df_4h[['ema_20_4h']], how='left').ffill()
-    df_indexed.reset_index(drop=True, inplace=True)
-    df = df_indexed
-
-    df['ema_20_1h'] = df['ema_20_1h'].fillna(df['close'])
-    df['ema_20_4h'] = df['ema_20_4h'].fillna(df['close'])
-
-    df['mtf_dist_1h'] = (df['close'] - df['ema_20_1h']) / df['ema_20_1h']
-    df['mtf_dist_4h'] = (df['close'] - df['ema_20_4h']) / df['ema_20_4h']
-
-    if btc_df is not None and not btc_df.empty:
-        btc_temp = btc_df[['timestamp', 'close']].copy()
-        btc_temp.rename(columns={'close': 'btc_close'}, inplace=True)
-        df = pd.merge(df, btc_temp, on='timestamp', how='left')
-        df['btc_close'] = df['btc_close'].ffill().bfill()
-
-        df['btc_log_return'] = np.log(df['btc_close'] / df['btc_close'].shift(1).replace(0, 1e-9)).fillna(0.0)
-        df['btc_correlation'] = df['log_return'].rolling(window=20).corr(df['btc_log_return']).fillna(0.0)
-        df.drop(columns=['btc_close'], inplace=True)
-    else:
-        df['btc_log_return'] = df['log_return']
-        df['btc_correlation'] = 1.0
-
-    df.fillna(0.0, inplace=True)
-    return df
-
-def cpu_bound_train(symbol, bars, btc_train_df):
-    if len(bars) < 100:
-        return f"⚠️ Dados insuficientes para {symbol}."
-
-    df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate'])
-    df = prepare_features(df, btc_train_df)
-    df = apply_triple_barrier(df)
-    df = df.dropna(subset=['target']).copy()
-
-    if len(df) < 50:
-        return f"⚠️ Alvos insuficientes após purga em {symbol}."
-
-    df['target'] = df['target'].astype(int)
-
-    hmm_model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42, min_covar=1e-3)
+    # ---- HMM: fit SOMENTE no treino (sem leakage) ----
+    hmm = GaussianHMM(
+        n_components=3, covariance_type="diag", n_iter=100,
+        random_state=42, min_covar=1e-3,
+    )
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            hmm_model.fit(df[['log_return', 'volatility_cluster']])
-        df['hmm_regime'] = hmm_model.predict(df[['log_return', 'volatility_cluster']])
+            hmm.fit(df_train[HMM_INPUTS].fillna(0.0).values)
+        for d, nome in ((df_train, "train"), (df_meta, "meta"), (df_cal, "cal")):
+            d["hmm_regime"] = aplicar_regime_hmm(d, hmm).values
     except Exception:
-        hmm_model = DummyHMM()
-        df['hmm_regime'] = 0
+        hmm = DummyHMM()
+        df_train["hmm_regime"] = 0
+        df_meta["hmm_regime"] = 0
+        df_cal["hmm_regime"] = 0
 
-    features = [
-        'RSI_14', 'price_vs_ema', 'vol_zscore', 'volatility_cluster', 'bb_pos', 'ADX_14',
-        'MACD_12_26_9', 'log_return', 'hmm_regime', 'rsi_divergence', 'cvd_trend', 'oi_change',
-        'oi_trend', 'oi_price_divergence', 'mtf_dist_1h', 'mtf_dist_4h', 'btc_log_return',
-        'btc_correlation', 'noise_index', 'obv_rsi_div', 'cvd_accel', 'vwap_dist',
-        'liq_vacuum', 'funding_rate_delta', 'oi_momentum', 'nvi', 'hurst_proxy',
-        'z_score_50', 'autocorr_3', 'fractal_dim', 'squeeze_ratio', 'natr', 'skewness_20', 'macd_hist_vel'
-    ]
+    feature_cols = FEATURE_NAMES + ["hmm_regime"]
+    faltantes = [f for f in feature_cols if f not in df_train.columns]
+    if faltantes:
+        return f"ERRO {symbol}: features ausentes {faltantes}"
 
-    X, y = df[features], df['target']
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+    X_train, X_meta = df_train[feature_cols], df_meta[feature_cols]
+    X_cal = df_cal[feature_cols]
 
-    if len(np.unique(y_train)) < 2:
-        return f"⚠️ Treino abortado para {symbol}: Base de treino sem contraste direcional."
-    if len(np.unique(y_val)) < 2:
-        return f"⚠️ Treino abortado para {symbol}: Base de validação sem contraste direcional."
-
+    # ---- Modelos base ----
     lgbm = lgb.LGBMClassifier(
-        n_estimators=150, learning_rate=0.03, max_depth=6, num_leaves=31,
-        class_weight='balanced', reg_alpha=0.1, reg_lambda=0.1,
-        random_state=42, verbose=-1, n_jobs=1
+        n_estimators=300, learning_rate=0.03, max_depth=6, num_leaves=31,
+        class_weight="balanced", reg_alpha=0.1, reg_lambda=0.1,
+        random_state=42, verbose=-1, n_jobs=2,
+    )
+    xgbm = xgb.XGBClassifier(
+        n_estimators=300, learning_rate=0.03, max_depth=5,
+        early_stopping_rounds=20, random_state=42,
+        eval_metric="logloss", n_jobs=2,
+    )
+    catb = CatBoostClassifier(
+        iterations=300, learning_rate=0.03, depth=5,
+        auto_class_weights="Balanced", l2_leaf_reg=3.0,
+        early_stopping_rounds=20, silent=True, random_state=42, thread_count=2,
     )
 
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=150, learning_rate=0.03, max_depth=5,
-        early_stopping_rounds=15, random_state=42, eval_metric='mlogloss', n_jobs=1
-    )
+    lgbm.fit(X_train, y_train)
+    xgbm.fit(X_train, y_train, eval_set=[(X_meta, y_meta)], verbose=False)
+    catb.fit(X_train, y_train, eval_set=(X_meta, y_meta), verbose=False)
 
-    cb_model = CatBoostClassifier(
-        iterations=150, learning_rate=0.03, depth=5,
-        auto_class_weights='Balanced', l2_leaf_reg=3.0, early_stopping_rounds=15,
-        silent=True, random_state=42, thread_count=1
-    )
-
-    lgbm.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)])
-    xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-    cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
-
-    X_meta_val = np.column_stack([
-        np.asarray(lgbm.predict_proba(X_val)),
-        np.asarray(xgb_model.predict_proba(X_val)),
-        np.asarray(cb_model.predict_proba(X_val))
+    # ---- Meta-learner: RF sobre probabilidades dos base ----
+    X_meta_stack = np.column_stack([
+        lgbm.predict_proba(X_meta),
+        xgbm.predict_proba(X_meta),
+        catb.predict_proba(X_meta),
     ])
-
-    meta_learner = RandomForestClassifier(
-        n_estimators=50, 
-        max_depth=3, 
-        class_weight='balanced', 
-        random_state=42, 
-        n_jobs=1
+    meta = RandomForestClassifier(
+        n_estimators=100, max_depth=4, class_weight="balanced",
+        random_state=42, n_jobs=2, min_samples_leaf=20,
     )
-    meta_learner.fit(X_meta_val, y_val)
+    meta.fit(X_meta_stack, y_meta)
 
-    # CORREÇÃO: Salvar os feature_names para evitar o "Contrato de Feature violado" 
-    # e garantir a compatibilidade com o analisador refatorado.
-    brain_data = {
-        'hmm': hmm_model, 
-        'lgbm': lgbm, 
-        'xgb': xgb_model, 
-        'catboost': cb_model,
-        'meta': meta_learner, 
-        'feature_names': features,
-        'last_trained': int(time.time())
+    # ---- Calibracao (cv='prefit' sobre bloco exclusivo) ----
+    X_cal_stack = np.column_stack([
+        lgbm.predict_proba(X_cal),
+        xgbm.predict_proba(X_cal),
+        catb.predict_proba(X_cal),
+    ])
+    calibrator = CalibratedClassifierCV(meta, cv="prefit", method="isotonic")
+    calibrator.fit(X_cal_stack, y_cal)
+
+    # Cria o modelo final integrado com as 49 features
+    pipeline_modelo = CalibratedStackingEnsemble(lgbm, xgbm, catb, calibrator)
+
+    # ---- Metricas no bloco de calibracao ----
+    prob_cal = pipeline_modelo.predict_proba(X_cal)[:, 1]
+    ll = log_loss(y_cal, np.column_stack([1 - prob_cal, prob_cal]))
+    brier = brier_score_loss(y_cal, prob_cal)
+
+    gate_mask = prob_cal >= (GATE_AVALIACAO / 100.0)
+    cobertura = float(gate_mask.mean())
+    if gate_mask.sum() >= 30:
+        precisao_gate = float((y_cal.values[gate_mask] == 1).mean())
+    else:
+        precisao_gate = float("nan")
+
+    # Expectativa em "R" (risco=1, ganho=1), descontando custos maker round-trip
+    custo_pct = (Config.MAKER_FEE_PCT + Config.SLIPPAGE_MAKER_PCT) * 2
+    custo_em_r = custo_pct / Config.BARRIER_PCT  # custo como fracao da barreira
+    if gate_mask.sum() >= 30:
+        p = precisao_gate
+        expectativa_r = p * (1 - custo_em_r) - (1 - p) * (1 + custo_em_r)
+    else:
+        expectativa_r = float("nan")
+
+    metrics = {
+        "logloss": round(float(ll), 4),
+        "brier": round(float(brier), 4),
+        "precisao_no_gate_65": round(precisao_gate, 4) if precisao_gate == precisao_gate else None,
+        "cobertura_gate_65": round(cobertura, 4),
+        "expectativa_r_no_gate": round(expectativa_r, 4) if expectativa_r == expectativa_r else None,
+        "n_train": int(len(X_train)),
+        "n_meta": int(len(X_meta)),
+        "n_cal": int(len(X_cal)),
+        "embargo_barras": int(embargo),
     }
 
-    safe_symbol_name = symbol.replace('/', '_').replace(':', '_')
-    file_path = os.path.join(Config.MODELS_DIR, f"{safe_symbol_name}.pkl")
-    joblib.dump(brain_data, file_path)
+    # ---- PERSISTENCIA — contrato com o analisador ----
+    payload = {
+        "modelo": pipeline_modelo,     # predict_proba(X_49) -> P(tocar +barreira)
+        "feature_names": feature_cols, # ordem exata
+        "hmm": hmm,
+        "symbol": symbol,
+        "barrier_pct": Config.BARRIER_PCT,
+        "label_horizon": Config.LABEL_HORIZON_CANDLES,
+        "timeframe": Config.TIMEFRAME,
+        "metrics": metrics,
+        "trained_at": int(time.time()),
+    }
 
-    return f"✅ Cérebro de {symbol} forjado sem overfit (Treinado no hold-out out-of-sample)."
+    nome_seguro = symbol.replace("/", "_").replace(":", "_")
+    caminho = Path(Config.MODELS_DIR) / f"{nome_seguro}.pkl"
+    joblib.dump(payload, caminho)
 
+    return (
+        f"OK {symbol} | logloss={ll:.4f} brier={brier:.4f} | "
+        f"gate65: prec={precisao_gate:.1%} cov={cobertura:.1%} "
+        f"E={expectativa_r:+.3f}R | train={len(X_train)} cal={len(X_cal)}"
+        if precisao_gate == precisao_gate else
+        f"OK {symbol} | logloss={ll:.4f} | gate65: amostra insuficiente "
+        f"({int(gate_mask.sum())} trades) — cobertura {cobertura:.1%}"
+    )
+
+
+# =====================================================================
+# MOTOR ASSINCRONO
+# =====================================================================
 class MotorTreinamento:
     def __init__(self):
-        opcoes_ccxt = {
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        }
-        self.exchange = ccxt_async.bybit(opcoes_ccxt)
-        self.btc_train_cache = []
-        self.btc_train_time = 0
+        self.exchange = ccxt_async.bybit(
+            {"enableRateLimit": True, "options": {"defaultType": "swap"}}
+        )
+        self.btc_symbol = "BTC/USDT:USDT"
 
-    async def fetch_historical(self, symbol, limit):
-        try:
-            all_ohlcv = []
-            since_ms = int((time.time() - (limit * 15 * 60)) * 1000)
-
-            while len(all_ohlcv) < limit:
-                batch = await self.exchange.fetch_ohlcv(symbol, Config.TIMEFRAME, since=since_ms, limit=1000)
-                if not batch or len(batch) == 0:
-                    break
-                since_ms = batch[-1][0] + 1
-                all_ohlcv.extend(batch)
-
-            all_ohlcv = all_ohlcv[-limit:]
-
-            try:
-                oi_data = await self.exchange.fetch_open_interest_history(symbol, Config.TIMEFRAME, limit=1000)
-                oi_map = {int(item.get('timestamp', 0)): float(item.get('openInterestValue') or item.get('info', {}).get('openInterest', 0)) for item in oi_data}
-            except Exception:
-                oi_map = {}
-
-            try:
-                fr_data = await self.exchange.fetch_funding_rate_history(symbol, limit=1000)
-                fr_map = {int(item.get('timestamp', 0)): float(item.get('fundingRate', 0)) for item in fr_data}
-            except Exception:
-                fr_map = {}
-
-            merged = []
-            last_oi, last_fr = 0.0, 0.0
-            for bar in all_ohlcv:
-                ts = int(bar[0])
-                if oi_map.get(ts, 0.0) != 0.0: last_oi = oi_map.get(ts, 0.0)
-                if fr_map.get(ts) is not None: last_fr = fr_map.get(ts)
-                merged.append([bar[0], bar[1], bar[2], bar[3], bar[4], bar[5], last_oi, last_fr])
-
-            return merged
-        except Exception as e:
-            logging.error(f"Erro assíncrono ao extrair histórico de {symbol}: {e}")
-            return []
-
-    async def get_btc_data(self):
-        # CORREÇÃO: Utilizando o universe_provider assíncrono para buscar ativos
+    async def iniciar_ciclo(self):
         ativos = await universe_provider.get_ativos()
-        if not ativos: return []
+        logging.info(f"Forja iniciada: {len(ativos)} ativos | tf={Config.TIMEFRAME} "
+                     f"| barreira +/-{Config.BARRIER_PCT}% | horizonte {Config.LABEL_HORIZON_CANDLES} velas")
 
-        if time.time() - self.btc_train_time > 3600 or not self.btc_train_cache:
-            logging.info("Sincronizando benchmark temporal (BTC) em modo Low-RAM...")
-            self.btc_train_cache = await self.fetch_historical(ativos[0], getattr(Config, 'CANDLES_TREINAMENTO_ML', 7000))
-            self.btc_train_time = time.time()
-        return self.btc_train_cache
-
-    async def iniciar_ciclo_treinamento(self):
-        # CORREÇÃO: Utilizando o universe_provider assíncrono para buscar ativos
-        ativos = await universe_provider.get_ativos()
-        logging.info(f"🚀 Iniciando Forja Institucional (Modo Low-RAM VPS) para {len(ativos)} moedas...")
-
-        btc_data_raw = await self.get_btc_data()
-        btc_train_df = pd.DataFrame(btc_data_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'funding_rate']) if btc_data_raw else None
+        btc_bars = await fetch_historico_completo(
+            self.exchange, self.btc_symbol, Config.CANDLES_TREINAMENTO
+        )
+        if not btc_bars:
+            logging.error("Benchmark BTC indisponivel — abortando ciclo.")
+            return
 
         loop = asyncio.get_running_loop()
-
+        ok = falhas = 0
         with ThreadPoolExecutor(max_workers=1) as pool:
             for symbol in ativos:
-                logging.info(f"📥 Baixando histórico de {symbol}...")
-                bars = await self.fetch_historical(symbol, getattr(Config, 'CANDLES_TREINAMENTO_ML', 7000))
-
+                logging.info(f"Baixando {symbol}...")
+                bars = await fetch_historico_completo(
+                    self.exchange, symbol, Config.CANDLES_TREINAMENTO
+                )
                 if not bars:
+                    logging.warning(f"Sem dados para {symbol}.")
+                    falhas += 1
                     continue
-
-                logging.info(f"🧠 Treinando modelo para {symbol}...")
                 try:
-                    resultado = await loop.run_in_executor(pool, cpu_bound_train, symbol, bars, btc_train_df)
-                    if "⚠️" in resultado:
-                        logging.warning(resultado)
-                    else:
-                        logging.info(resultado)
-                except Exception as exc:
-                    logging.error(f"❌ Falha fatal processando {symbol}: {exc}")
-
+                    msg = await loop.run_in_executor(
+                        pool, treinar_simbolo, symbol, bars, btc_bars
+                    )
+                    logging.info(f"Treino {symbol}: {msg}")
+                    ok += 1 if msg.startswith("OK") else 0
+                    falhas += 0 if msg.startswith("OK") else 1
+                except Exception as e:
+                    logging.error(f"Falha fatal {symbol}: {e}")
+                    falhas += 1
                 del bars
                 gc.collect()
 
-        logging.info(f"💤 Treinamento blindado concluído. O motor vai hibernar por {getattr(Config, 'HORAS_RETREINO', 24)} horas.")
+        logging.info(
+            f"Ciclo concluido: {ok} modelos | {falhas} pulados/falhas. "
+            f"Proximo ciclo em {Config.HORAS_RETREINO}h."
+        )
+
 
 async def main():
-    treinador = MotorTreinamento()
-    while True:
-        try:
-            await treinador.iniciar_ciclo_treinamento()
-            logging.info("Aguardando próximo ciclo...")
-            await asyncio.sleep(getattr(Config, 'HORAS_RETREINO', 24) * 3600)
-        except Exception as e:
-            logging.error(f"Erro Crítico no Loop do Treinador: {e}")
-            await asyncio.sleep(60)
+    motor = MotorTreinamento()
+    try:
+        while True:
+            try:
+                await motor.iniciar_ciclo()
+            except Exception as e:
+                logging.error(f"Erro no ciclo: {e}")
+            await asyncio.sleep(Config.HORAS_RETREINO * 3600)
+    finally:
+        await motor.exchange.close()
+
 
 if __name__ == "__main__":
     try:
-        if os.name == 'nt':
+        if os.name == "nt":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("🛑 Treinador encerrado pelo usuário.")
+        logging.info("Treinador encerrado.")

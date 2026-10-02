@@ -1,516 +1,452 @@
+"""
+gerenciador.py — Gestao de risco e posicoes do Predador v3.2.
+
+PAPEL:
+    1. Consome elite_signals (analisador) — so entradas com 1 posicao livre
+    2. Sizing: risco = saldo x MAX_POSITION_RISK (1% = $1) — nocional via barreira
+       qty = risco_usd / (preco x BARRIER_PCT%)  -> ex.: $1 / 0,20% = $500
+    3. SL/TP exatos nas barreiras (+/-BARRIER_PCT%) — payoff 1:1 embutido no rotulo
+    4. Time-stop de TIME_STOP_MINUTES (15 min = 3 velas de 5m)
+    5. Oraculo (L2+CVD Binance) como filtro final antes de cada entrada
+    6. Kill-switch: drawdown diario e sequencia de perdas
+    7. Cooldown por simbolo apos stop
+
+CONTRATO COM O EXECUTOR (Passo 7):
+    EngineExecutor.order_router_inbound(packet) -> bool
+    EngineExecutor.execution.get_current_positions() -> list[dict]
+    EngineExecutor.execution.get_equity() -> float
+    EngineExecutor.execution.close_position_market(symbol, side, qty) -> bool
+    EngineExecutor.modify_position_tp_sl(symbol, take_profit, stop_loss) -> bool
+    packet = {symbol, direction, qty, entry_price, tp, sl, barrier_pct, module}
+"""
+
 import sys
-import os
+import time
 import asyncio
 import logging
-import time
 import aiosqlite
-import numpy as np
-from config import Config
-from executor import EngineExecutor, TelegramLogger
 
-if sys.platform == 'win32':
+import numpy as np
+
+from config import Config, BASE_DIR
+from executor import EngineExecutor, TelegramLogger
+from oraculo import OraculoBinance
+
+if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - [GERENCIADOR] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s - [GERENCIADOR] - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-class GerenciadorRiscoAutonomo:
+SINAL_MAX_IDADE_SEC = 90.0   # ignora sinal mais velho que 1:30
+USA_BREAK_EVEN = False       # fase 1: desligado (testar no backtest depois)
+
+
+class GerenciadorRisco:
     def __init__(self):
         self.executor = EngineExecutor()
-        self.db = self.executor.db
+        self.oraculo = OraculoBinance()
+        self.db_name = str(BASE_DIR / Config.DB_NAME)
 
-        # Estado interno por símbolo (Bot Direcional)
-        self.posicoes_monitoradas = {}
-        self.fechamento_em_andamento = {} 
+        self.posicoes: dict = {}          # symbol -> estado local da posicao
+        self.fechando: dict = {}          # symbol -> ts do inicio do fechamento
+        self.last_summary = 0.0
+        self.pnl_acumulado = 0.0
+        self.pnl_dia = 0.0
+        self.dia_atual = time.strftime("%Y-%m-%d")
+        self.perdas_seg = 0
+        self.kill_switch = False
 
-        # Estado interno por par (Bot Arbitragem)
-        self.pares_arbitragem_monitorados = {}
-        self.pernas_arbitragem_ativas = set() # Set para bloquear a interferência do bot direcional
-
-        self.last_summary_time = time.time()
-        self.pnl_realizado_acumulado = 0.0
-
+    # ------------------------------------------------------------------
+    # ESTADO
+    # ------------------------------------------------------------------
     @property
-    def saldo_atual(self) -> float:
-        """Calcula o saldo da banca em tempo real"""
-        banca_inicial = getattr(Config, 'BANCA_DEMO_INICIAL', 100.0)
-        return banca_inicial + self.pnl_realizado_acumulado
+    def saldo(self) -> float:
+        """Banca real (equity da conta) + fallback para a configurada."""
+        try:
+            eq = self.executor.execution.get_equity_sync_if_available()
+            if eq and eq > 0:
+                return float(eq)
+        except Exception:
+            pass
+        return float(Config.BANCA_INICIAL_USD) + self.pnl_acumulado
 
-    async def setup_db_arbitragem(self):
-        """Garante que a tabela de sinais de arbitragem exista para não quebrar a VPS"""
-        db_name = getattr(Config, 'DB_NAME', 'predador_v31.db')
-        async with aiosqlite.connect(db_name) as db_conn:
-            await db_conn.execute('''
-                CREATE TABLE IF NOT EXISTS sinais_arbitragem (
-                    par_id TEXT PRIMARY KEY,
-                    leg_long TEXT,
-                    leg_short TEXT,
-                    price_long REAL,
-                    price_short REAL,
-                    target_pnl_usd REAL,
-                    stop_pnl_usd REAL
-                )
-            ''')
-            await db_conn.commit()
+    def _reset_dia(self):
+        hoje = time.strftime("%Y-%m-%d")
+        if hoje != self.dia_atual:
+            self.dia_atual = hoje
+            self.pnl_dia = 0.0
+            self.perdas_seg = 0
+            self.kill_switch = False
 
-    def _calcular_risco_e_alvos(self, entry: float, sl: float, side: str) -> dict:
-        if side.upper() in ['BUY', 'LONG']:
-            risk_distance = abs(entry - sl)
-            tp = entry + (risk_distance * 2.0)          # 2R
-            be_price = entry + (risk_distance * 0.05)   # BE + 5% do risco (cobre taxas)
+    def _registrar_resultado(self, pnl: float, symbol: str, motivo: str):
+        self.pnl_acumulado += pnl
+        self.pnl_dia += pnl
+        if pnl < 0:
+            self.perdas_seg += 1
         else:
-            risk_distance = abs(sl - entry)
-            tp = entry - (risk_distance * 2.0)          # 2R
-            be_price = entry - (risk_distance * 0.05)   # BE + 5% do risco
+            self.perdas_seg = 0
 
-        return {
-            "risk_distance": risk_distance,
-            "tp": tp,
-            "be_price": be_price
-        }
+        asyncio.ensure_future(self._gravar_historico(symbol, pnl, motivo))
 
-    # =========================================================================
-    # MOTOR 1: GESTÃO DIRECIONAL (Mantido Intacto)
-    # =========================================================================
-    async def executar_novas_entradas(self):
+        if self.pnl_dia <= -(max(self.saldo, 1.0) * Config.MAX_DAILY_DRAWDOWN):
+            self.kill_switch = True
+            logging.warning(f"KILL-SWITCH: drawdown diario ${self.pnl_dia:.2f}")
+        if self.perdas_seg >= Config.MAX_CONSECUTIVE_LOSSES:
+            self.kill_switch = True
+            logging.warning(f"KILL-SWITCH: {self.perdas_seg} perdas consecutivas")
+
+    async def _gravar_historico(self, symbol: str, pnl: float, motivo: str):
         try:
-            sinais = await self.db.get_elite_signals()
-            if not sinais:
-                return
-
-            positions = await self.executor.execution.get_current_positions(self.db)
-            max_trades = getattr(Config, 'MAX_OPEN_TRADES', 5)
-            
-            # Filtra apenas os símbolos que NÃO são de arbitragem
-            simbolos_abertos = [
-                p.get('symbol') for p in positions 
-                if p.get('symbol') not in self.pernas_arbitragem_ativas
-            ]
-
-            if len(simbolos_abertos) >= max_trades:
-                return
-
-            for sinal in sinais:
-                if len(simbolos_abertos) >= max_trades:
-                    break
-
-                symbol = sinal['symbol']
-                direction = sinal['direction']
-                entry = sinal['price']
-
-                # Bloqueio duplo: Se a moeda já está na arbitragem, não opera ela aqui
-                if symbol in simbolos_abertos or symbol in self.pernas_arbitragem_ativas:
-                    continue
-
-                cooldown = await self.db.get_cooldown(symbol)
-                if time.time() < cooldown:
-                    continue
-
-                distancia_sl_pct = 0.005 
-                
-                if direction in ['BUY', 'LONG']:
-                    sl = entry * (1 - distancia_sl_pct)
-                else:
-                    sl = entry * (1 + distancia_sl_pct)
-
-                alvos = self._calcular_risco_e_alvos(entry, sl, direction)
-                tp = alvos['tp']
-
-                banca_neste_momento = self.saldo_atual
-                risco_pct = getattr(Config, 'MAX_POSITION_RISK', 0.01)
-                risco_usd = banca_neste_momento * risco_pct
-
-                risk_distance_price = abs(entry - sl)
-                if risk_distance_price == 0:
-                    continue
-
-                qty = risco_usd / risk_distance_price
-
-                order_packet = {
-                    'symbol': symbol,
-                    'direction': direction,
-                    'qty': qty,
-                    'current_price': entry,
-                    'tp': tp,
-                    'sl': sl
-                }
-
-                logging.info(f"⚡ ORDEM DIRECIONAL: {symbol} | {direction} | Qty: {qty:.4f} | Risco: ${risco_usd:.2f}")
-                sucesso = await self.executor.order_router_inbound(order_packet)
-
-                if sucesso:
-                    msg = (
-                        f"🎯 <b>NOVA POSIÇÃO DIRECIONAL ABERTA</b>\n"
-                        f"Moeda: {symbol}\n"
-                        f"Direção: {direction}\n"
-                        f"Entrada: {entry:.5f}\n"
-                        f"Take Profit (2R): {tp:.5f}\n"
-                        f"Score IA: {sinal.get('score', 0):.1f}/10\n"
-                        f"💰 Saldo da Banca: ${banca_neste_momento:.2f}"
+            async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT, side TEXT, pnl REAL,
+                        motivo TEXT, timestamp REAL
                     )
-                    await TelegramLogger.send(msg)
-                    simbolos_abertos.append(symbol)
-
-            await self.db.clear_elite_signals()
-
+                    """
+                )
+                await conn.execute(
+                    "INSERT INTO history (symbol, side, pnl, motivo, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (symbol, self.posicoes.get(symbol, {}).get("direction", "?"),
+                     pnl, motivo, time.time()),
+                )
+                await conn.commit()
         except Exception as e:
-            logging.error(f"Erro no módulo de execução direcional: {e}")
+            logging.error(f"Falha ao gravar historico: {e}")
 
-    async def sincronizar_posicoes_abertas(self):
-        try:
-            positions = await self.executor.execution.get_current_positions(self.db)
-        except Exception as e:
-            logging.error(f"Erro ao buscar posições na corretora: {e}")
-            return
-
-        symbols_ativos = set()
-
-        for p in positions:
-            symbol = p.get('symbol')
-            if not symbol:
-                continue
-            
-            # IGNORA COMPLETAMENTE AS MOEDAS QUE ESTÃO NA ARBITRAGEM
-            if symbol in self.pernas_arbitragem_ativas:
-                continue
-
-            if symbol in self.fechamento_em_andamento:
-                if time.time() - self.fechamento_em_andamento[symbol] < 30:
-                    continue 
-                else:
-                    del self.fechamento_em_andamento[symbol]
-
-            symbols_ativos.add(symbol)
-
-            side = p.get('side', '').upper()
-            entry = float(p.get('entryPrice', p.get('price', 0.0)))
-            qty = float(p.get('contracts', p.get('amount', p.get('size', 0.0))))
-            current_sl = float(p.get('stopLoss', p.get('sl', 0.0)))
-            current_tp = float(p.get('takeProfit', p.get('tp', 0.0)))
-            net_pnl = float(p.get('netPnl', 0.0))
-
-            if symbol not in self.posicoes_monitoradas:
-                if current_sl <= 0:
-                    if side in ['BUY', 'LONG']:
-                        current_sl = entry * 0.995
-                    else:
-                        current_sl = entry * 1.005
-
-                alvos = self._calcular_risco_e_alvos(entry, current_sl, side)
-
-                be_status_inicial = False
-                if current_sl > 0:
-                    if side in ['BUY', 'LONG'] and current_sl >= alvos["be_price"] * 0.999:
-                        be_status_inicial = True
-                    elif side in ['SELL', 'SHORT'] and current_sl <= alvos["be_price"] * 1.001:
-                        be_status_inicial = True
-
-                self.posicoes_monitoradas[symbol] = {
-                    "entry": entry,
-                    "original_sl": current_sl,
-                    "risk_distance": alvos["risk_distance"],
-                    "current_sl": current_sl,
-                    "current_tp": alvos["tp"],
-                    "be_price": alvos["be_price"],
-                    "side": side,
-                    "qty": qty,
-                    "be_ativado": be_status_inicial,
-                    "max_pnl": net_pnl,
-                    "min_pnl": net_pnl,
-                    "last_net_pnl": net_pnl
-                }
-
-                try:
-                    await self.executor.execution.modify_position_tp_sl(
-                        symbol=symbol,
-                        take_profit=alvos["tp"],
-                        stop_loss=current_sl
-                    )
-                except Exception as e:
-                    pass
-
-            else:
-                mon = self.posicoes_monitoradas[symbol]
-                mon["last_net_pnl"] = net_pnl
-                if net_pnl > mon["max_pnl"]:
-                    mon["max_pnl"] = net_pnl
-                if net_pnl < mon["min_pnl"]:
-                    mon["min_pnl"] = net_pnl
-
-        symbols_para_remover = [s for s in self.posicoes_monitoradas if s not in symbols_ativos]
-        for s in symbols_para_remover:
-            pnl_fechamento = self.posicoes_monitoradas[s].get("last_net_pnl", 0.0)
-            self.pnl_realizado_acumulado += pnl_fechamento
-            
-            msg = (
-                f"🏁 <b>POSIÇÃO DIRECIONAL ENCERRADA</b>\n"
-                f"Moeda: {s}\n"
-                f"PnL Realizado: ${pnl_fechamento:+.2f}\n"
-                f"💰 Novo Saldo da Banca: ${self.saldo_atual:.2f}"
+    # ------------------------------------------------------------------
+    # LEITURA DE SINAIS
+    # ------------------------------------------------------------------
+    async def _ler_sinais(self) -> list:
+        agora = time.time()
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT symbol, direction, price, prob, score, barrier_pct, timestamp
+                FROM elite_signals
+                WHERE timestamp > ?
+                ORDER BY prob DESC
+                """,
+                (agora - SINAL_MAX_IDADE_SEC,),
             )
-            await TelegramLogger.send(msg)
-            del self.posicoes_monitoradas[s]
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
-    async def gerenciar_posicoes_2r(self):
-        if not self.posicoes_monitoradas:
+    # ------------------------------------------------------------------
+    # NOVAS ENTRADAS
+    # ------------------------------------------------------------------
+    async def executar_novas_entradas(self):
+        if self.kill_switch:
+            return
+        if len(self.posicoes) >= Config.MAX_OPEN_TRADES:
             return
 
-        try:
-            positions = await self.executor.execution.get_current_positions(self.db)
-        except Exception:
+        sinais = await self._ler_sinais()
+        if not sinais:
             return
 
-        pos_dict = {p.get('symbol'): p for p in positions if p.get('symbol') and p.get('symbol') not in self.pernas_arbitragem_ativas}
-        db_name = getattr(Config, 'DB_NAME', 'predador_v31.db')
+        positions = await self.executor.execution.get_current_positions()
+        abertos_exchange = {p.get("symbol") for p in positions if p.get("symbol")}
+        if len(abertos_exchange) >= Config.MAX_OPEN_TRADES:
+            return
 
-        for symbol, mon in list(self.posicoes_monitoradas.items()):
-            if symbol not in pos_dict:
+        for sinal in sinais:
+            if len(self.posicoes) >= Config.MAX_OPEN_TRADES:
+                break
+
+            symbol = sinal["symbol"]
+            direction = sinal["direction"]
+            price = float(sinal["price"])
+            barrier_pct = float(sinal.get("barrier_pct") or Config.BARRIER_PCT)
+
+            if symbol in self.posicoes or symbol in abertos_exchange:
                 continue
 
-            p = pos_dict[symbol]
-            net_pnl = float(p.get('netPnl', 0.0))
-            entry = mon["entry"]
-            risk = mon["risk_distance"]
-            side = mon["side"]
-            qty = mon["qty"]
+            if await self._em_cooldown(symbol):
+                continue
 
-            current_price = float(p.get('markPrice', p.get('price', entry)))
-            
-            if side in ['BUY', 'LONG']:
-                pnl_em_r = (current_price - entry) / risk if risk > 0 else 0.0
+            # ---- Oraculo: filtro final de fluxo ----
+            aprovado, motivo = await self.oraculo.validar_sinal_institucional(
+                symbol, direction
+            )
+            if not aprovado:
+                logging.info(f"Oraculo bloqueou {symbol} {direction}: {motivo}")
+                continue
+
+            # ---- Sizing: risco fixo em $, distancia = barreira em % ----
+            risco_usd = self.saldo * Config.MAX_POSITION_RISK
+            distancia = price * (barrier_pct / 100.0)
+            if distancia <= 0:
+                continue
+            qty = risco_usd / distancia
+            if qty <= 0:
+                continue
+
+            if direction == "BUY":
+                sl = price - distancia
+                tp = price + distancia
             else:
-                pnl_em_r = (entry - current_price) / risk if risk > 0 else 0.0
+                sl = price + distancia
+                tp = price - distancia
 
-            if pnl_em_r >= 1.98 or pnl_em_r <= -1.0:
-                self.fechamento_em_andamento[symbol] = time.time()
-                self.pnl_realizado_acumulado += net_pnl
-                
-                tipo_msg = "🏆 ALVO 2R ATINGIDO" if pnl_em_r >= 1.98 else "🚨 STOP LOSS EXECUTADO"
-                msg = (
-                    f"{tipo_msg}\n"
-                    f"Moeda: {symbol}\n"
-                    f"Resultado: ${net_pnl:+.2f} ({pnl_em_r:.2f}R)\n"
-                    f"💰 Novo Saldo da Banca: ${self.saldo_atual:.2f}"
-                )
-                await TelegramLogger.send(msg)
-                
-                try:
-                    close_side = "SELL" if side in ["BUY", "LONG"] else "BUY"
-                    if getattr(Config, 'OPERA_CONTA_REAL', False):
-                        await self.executor.execution.exchange.create_order(
-                            symbol=symbol, type='market', side=close_side,
-                            amount=qty, params={'reduceOnly': True}
-                        )
-                except Exception as e:
-                    logging.error(f"[{symbol}] Falha ao fechar a mercado: {e}")
-                finally:
-                    async with aiosqlite.connect(db_name, timeout=30) as db_conn:
-                        await db_conn.execute("DELETE FROM trades WHERE symbol = ?", (symbol,))
-                        await db_conn.commit()
-                    
-                    if symbol in self.posicoes_monitoradas:
-                        del self.posicoes_monitoradas[symbol]
-                continue 
+            packet = {
+                "symbol": symbol,
+                "direction": direction,
+                "qty": qty,
+                "entry_price": price,
+                "tp": tp,
+                "sl": sl,
+                "barrier_pct": barrier_pct,
+                "module": "directional",
+            }
 
-            current_sl_corretora = float(p.get('stopLoss', p.get('sl', 0.0)))
-            ja_no_be = False
-            
-            if current_sl_corretora > 0:
-                if side in ['BUY', 'LONG'] and current_sl_corretora >= mon["be_price"] * 0.999:
-                    ja_no_be = True
-                elif side in ['SELL', 'SHORT'] and current_sl_corretora <= mon["be_price"] * 1.001:
-                    ja_no_be = True
+            logging.info(
+                f"ENTRY {direction} {symbol} | qty={qty:.6f} "
+                f"risco=${risco_usd:.2f} | SL={sl:.6f} TP={tp:.6f} "
+                f"(+/-{barrier_pct}%) | Oraculo: {motivo}"
+            )
 
-            if (not mon["be_ativado"] and not ja_no_be) and pnl_em_r >= 1.0:
-                novo_sl = mon["be_price"]
-                try:
-                    await self.executor.execution.modify_position_tp_sl(
-                        symbol=symbol, take_profit=mon["current_tp"], stop_loss=novo_sl
-                    )
-                    mon["current_sl"] = novo_sl
-                    mon["be_ativado"] = True
-                except Exception:
-                    pass
+            ok = await self.executor.order_router_inbound(packet)
+            if not ok:
+                continue
 
-    # =========================================================================
-    # MOTOR 2: GESTÃO DE ARBITRAGEM ESTATÍSTICA (NOVO)
-    # =========================================================================
-    async def executar_novas_entradas_arbitragem(self):
+            self.posicoes[symbol] = {
+                "direction": direction,
+                "entry": price,
+                "qty": qty,
+                "sl": sl,
+                "tp": tp,
+                "barrier_dist": distancia,
+                "be_price": price,           # BE desativado: preco de entrada
+                "be_ativado": True,          # ja "ativado" = nunca move
+                "open_time": time.time(),
+                "max_pnl_r": 0.0,
+            }
+
+            await TelegramLogger.send(
+                f"📈 ENTRY {direction} {symbol}\n"
+                f"Preço: {price:.6f}\n"
+                f"SL: {sl:.6f} | TP: {tp:.6f} (+/-{barrier_pct}%)\n"
+                f"Risco: ${risco_usd:.2f} | P(sinal): {sinal['prob']:.1f}%\n"
+                f"Time-stop: {Config.TIME_STOP_MINUTES} min\n"
+                f"Saldo: ${self.saldo:.2f}\n"
+                f"Oráculo: {motivo}"
+            )
+
+        await self._limpar_sinais()
+
+    async def _limpar_sinais(self):
         try:
-            db_name = getattr(Config, 'DB_NAME', 'predador_v31.db')
-            async with aiosqlite.connect(db_name) as db_conn:
-                db_conn.row_factory = aiosqlite.Row
-                cursor = await db_conn.execute("SELECT * FROM sinais_arbitragem")
-                sinais_arb = await cursor.fetchall()
+            async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+                await conn.execute("DELETE FROM elite_signals")
+                await conn.commit()
+        except Exception:
+            pass
 
-            if not sinais_arb:
-                return
+    async def _em_cooldown(self, symbol: str) -> bool:
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            cur = await conn.execute(
+                "SELECT release_time FROM cooldowns WHERE symbol = ?", (symbol,)
+            )
+            row = await cur.fetchone()
+        return bool(row and time.time() < row[0])
 
-            max_pares = getattr(Config, 'ARB_MAX_PARES_ATIVOS', 5)
+    async def _set_cooldown(self, symbol: str, minutos: int):
+        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cooldowns
+                (symbol TEXT PRIMARY KEY, release_time REAL)
+                """
+            )
+            await conn.execute(
+                "INSERT OR REPLACE INTO cooldowns VALUES (?, ?)",
+                (symbol, time.time() + minutos * 60),
+            )
+            await conn.commit()
 
-            for sinal in sinais_arb:
-                if len(self.pares_arbitragem_monitorados) >= max_pares:
-                    break
-
-                par_id = sinal['par_id']
-                leg_long = sinal['leg_long']
-                leg_short = sinal['leg_short']
-
-                if par_id in self.pares_arbitragem_monitorados:
-                    continue
-
-                # Evita operar moedas que o direcional já está usando
-                if leg_long in self.posicoes_monitoradas or leg_short in self.posicoes_monitoradas:
-                    continue
-
-                # Capital Market Neutral: O mesmo valor em USD em ambas as pontas
-                banca = self.saldo_atual
-                alocacao_usd_por_perna = banca * getattr(Config, 'ARB_MAX_POSITION_RISK', 0.01)
-
-                qty_long = alocacao_usd_por_perna / sinal['price_long']
-                qty_short = alocacao_usd_por_perna / sinal['price_short']
-
-                # Pacote Long
-                sucesso_long = await self.executor.order_router_inbound({
-                    'symbol': leg_long, 'direction': 'BUY',
-                    'qty': qty_long, 'current_price': sinal['price_long'],
-                    'tp': 0.0, 'sl': 0.0 # O controle será via software pelo PnL Agregado
-                })
-
-                # Pacote Short
-                sucesso_short = await self.executor.order_router_inbound({
-                    'symbol': leg_short, 'direction': 'SELL',
-                    'qty': qty_short, 'current_price': sinal['price_short'],
-                    'tp': 0.0, 'sl': 0.0 
-                })
-
-                if sucesso_long and sucesso_short:
-                    self.pares_arbitragem_monitorados[par_id] = {
-                        "leg_long": leg_long, "leg_short": leg_short,
-                        "qty_long": qty_long, "qty_short": qty_short,
-                        "target_pnl": sinal['target_pnl_usd'],
-                        "stop_pnl": sinal['stop_pnl_usd']
-                    }
-                    self.pernas_arbitragem_ativas.add(leg_long)
-                    self.pernas_arbitragem_ativas.add(leg_short)
-
-                    msg = (
-                        f"⚖️ <b>NOVO PAR DE ARBITRAGEM ABERTO</b>\n"
-                        f"Par: {par_id}\n"
-                        f"Long: {leg_long} (${alocacao_usd_por_perna:.2f})\n"
-                        f"Short: {leg_short} (${alocacao_usd_por_perna:.2f})\n"
-                        f"Target Sintético: ${sinal['target_pnl_usd']:.2f}\n"
-                        f"Stop Sintético: ${sinal['stop_pnl_usd']:.2f}"
-                    )
-                    await TelegramLogger.send(msg)
-
-                    # Limpa o sinal executado
-                    async with aiosqlite.connect(db_name) as db_conn:
-                        await db_conn.execute("DELETE FROM sinais_arbitragem WHERE par_id = ?", (par_id,))
-                        await db_conn.commit()
-
+    # ------------------------------------------------------------------
+    # GESTAO DAS POSICOES ABERTAS
+    # ------------------------------------------------------------------
+    async def sincronizar_posicoes(self):
+        """Alinha estado local com a exchange; detecta fechamentos naturais."""
+        try:
+            positions = await self.executor.execution.get_current_positions()
         except Exception as e:
-            logging.error(f"Erro na abertura de arbitragem: {e}")
+            logging.error(f"Falha ao buscar posicoes: {e}")
+            return
 
-    async def gerenciar_posicoes_arbitragem(self):
-        if not self.pares_arbitragem_monitorados:
+        ativos_agora = set()
+        pos_dict = {p.get("symbol"): p for p in positions if p.get("symbol")}
+
+        for symbol, p in pos_dict.items():
+            ativos_agora.add(symbol)
+            net_pnl = float(p.get("netPnl", 0.0))
+
+            if symbol not in self.posicoes:
+                # Posicao aberta externamente (restart do bot): adota
+                entry = float(p.get("entryPrice", 0.0))
+                side = str(p.get("side", "")).upper()
+                self.posicoes[symbol] = {
+                    "direction": "BUY" if side in ("LONG", "BUY") else "SELL",
+                    "entry": entry,
+                    "qty": float(p.get("contracts", 0.0)),
+                    "sl": float(p.get("stopLoss", 0.0) or 0.0),
+                    "tp": float(p.get("takeProfit", 0.0) or 0.0),
+                    "barrier_dist": 0.0,
+                    "be_price": entry,
+                    "be_ativado": True,
+                    "open_time": time.time(),
+                    "max_pnl_r": 0.0,
+                }
+                logging.warning(f"Posicao {symbol} adotada da exchange (restart).")
+
+            self.posicoes[symbol]["_net_pnl"] = net_pnl
+
+        # Fechadas na exchange (SL/TP tocado ou manual)
+        for symbol in list(self.posicoes):
+            if symbol not in ativos_agora and symbol not in self.fechando:
+                mon = self.posicoes.pop(symbol)
+                pnl = mon.get("_net_pnl", 0.0)
+                self._registrar_resultado(pnl, symbol, "fechada_na_exchange")
+                await self._set_cooldown(symbol, Config.COOLDOWN_POS_LOSS_MIN)
+                await TelegramLogger.send(
+                    f"🏁 POSICAO ENCERRADA {symbol}\n"
+                    f"PnL: ${pnl:+.2f}\nSaldo: ${self.saldo:.2f}"
+                )
+
+    async def gerenciar_posicoes(self):
+        if not self.posicoes:
             return
 
         try:
-            positions = await self.executor.execution.get_current_positions(self.db)
-            pos_dict = {p.get('symbol'): p for p in positions}
+            positions = await self.executor.execution.get_current_positions()
         except Exception:
             return
 
-        pares_para_fechar = []
+        pos_dict = {p.get("symbol"): p for p in positions if p.get("symbol")}
+        agora = time.time()
 
-        for par_id, dados in self.pares_arbitragem_monitorados.items():
-            l_sym, s_sym = dados['leg_long'], dados['leg_short']
-            
-            pnl_long = float(pos_dict.get(l_sym, {}).get('netPnl', 0.0)) if l_sym in pos_dict else 0.0
-            pnl_short = float(pos_dict.get(s_sym, {}).get('netPnl', 0.0)) if s_sym in pos_dict else 0.0
-            
-            pnl_sintetico_total = pnl_long + pnl_short
+        for symbol, mon in list(self.posicoes.items()):
+            if symbol in self.fechando:
+                if agora - self.fechando[symbol] < 20:
+                    continue
+                del self.fechando[symbol]
 
-            atingiu_alvo = pnl_sintetico_total >= dados['target_pnl']
-            atingiu_stop = pnl_sintetico_total <= dados['stop_pnl']
+            p = pos_dict.get(symbol)
+            if p is None:
+                continue  # sincronizar_posicoes ja tratou
 
-            if atingiu_alvo or atingiu_stop:
-                pares_para_fechar.append((par_id, l_sym, s_sym, pnl_sintetico_total, atingiu_alvo))
+            entry = mon["entry"]
+            dist = mon["barrier_dist"]
+            side = mon["direction"]
+            current = float(p.get("markPrice", p.get("price", entry)))
+            net_pnl = float(p.get("netPnl", 0.0))
+            mon["_net_pnl"] = net_pnl
 
-        # Fechamento Simultâneo
-        for par_id, l_sym, s_sym, pnl_total, win in pares_para_fechar:
-            self.pnl_realizado_acumulado += pnl_total
-            icone = "🎯 WIN SINTÉTICO" if win else "⚠️ STOP SINTÉTICO"
-            
-            try:
-                if getattr(Config, 'OPERA_CONTA_REAL', False):
-                    # Fecha Leg Long
-                    await self.executor.execution.exchange.create_order(
-                        symbol=l_sym, type='market', side='SELL',
-                        amount=self.pares_arbitragem_monitorados[par_id]['qty_long'], params={'reduceOnly': True}
-                    )
-                    # Fecha Leg Short
-                    await self.executor.execution.exchange.create_order(
-                        symbol=s_sym, type='market', side='BUY',
-                        amount=self.pares_arbitragem_monitorados[par_id]['qty_short'], params={'reduceOnly': True}
-                    )
-            except Exception as e:
-                logging.error(f"[{par_id}] Erro ao forçar fechamento duplo da arbitragem: {e}")
-            finally:
-                msg = (
-                    f"{icone} <b>(ARBITRAGEM)</b>\n"
-                    f"Par: {par_id}\n"
-                    f"Resultado do Spread: ${pnl_total:+.2f}\n"
-                    f"💰 Novo Saldo da Banca: ${self.saldo_atual:.2f}"
-                )
-                await TelegramLogger.send(msg)
-                
-                # Libera a memória para novos trades
-                self.pernas_arbitragem_ativas.discard(l_sym)
-                self.pernas_arbitragem_ativas.discard(s_sym)
-                del self.pares_arbitragem_monitorados[par_id]
+            # ---- TIME-STOP (15 min) ----
+            idade_min = (agora - mon["open_time"]) / 60.0
+            if idade_min >= Config.TIME_STOP_MINUTES:
+                motivo = f"TIME-STOP ({idade_min:.0f} min)"
+                if dist > 0:
+                    pnl_r = ((current - entry) / dist) if side == "BUY" \
+                        else ((entry - current) / dist)
+                    motivo += f" | {pnl_r:+.2f}R"
+                await self._fechar(symbol, mon, net_pnl, motivo)
+                continue
 
-    async def relatorio_periodico(self):
-        now = time.time()
-        if now - self.last_summary_time < 600:
+            # ---- HARD STOP local (rede/WS falhou na exchange) ----
+            if dist > 0:
+                pnl_r = ((current - entry) / dist) if side == "BUY" \
+                    else ((entry - current) / dist)
+                mon["max_pnl_r"] = max(mon["max_pnl_r"], pnl_r)
+
+                if pnl_r <= -1.05:  # 5% de folga sobre a barreira negativa
+                    await self._fechar(symbol, mon, net_pnl,
+                                       f"HARD STOP local ({pnl_r:.2f}R)")
+                    continue
+
+                # ---- BREAK-EVEN (fase 2 — desligado) ----
+                if USA_BREAK_EVEN and not mon["be_ativado"] and pnl_r >= 1.0:
+                    try:
+                        await self.executor.modify_position_tp_sl(
+                            symbol, take_profit=mon["tp"], stop_loss=mon["be_price"]
+                        )
+                        mon["be_ativado"] = True
+                        mon["sl"] = mon["be_price"]
+                        logging.info(f"[{symbol}] BE ativado")
+                    except Exception:
+                        pass
+
+    async def _fechar(self, symbol: str, mon: dict, net_pnl: float, motivo: str):
+        self.fechando[symbol] = time.time()
+        self._registrar_resultado(net_pnl, symbol, motivo)
+
+        await TelegramLogger.send(
+            f"{'🛑' if net_pnl < 0 else '✅'} {motivo}\n"
+            f"{symbol}\nPnL: ${net_pnl:+.2f}\nSaldo: ${self.saldo:.2f}"
+        )
+        try:
+            close_side = "SELL" if mon["direction"] == "BUY" else "BUY"
+            await self.executor.execution.close_position_market(
+                symbol, close_side, mon["qty"]
+            )
+        except Exception as e:
+            logging.error(f"[{symbol}] Falha ao fechar: {e}")
+        finally:
+            self.posicoes.pop(symbol, None)
+            await self._set_cooldown(symbol, Config.COOLDOWN_POS_LOSS_MIN)
+
+    # ------------------------------------------------------------------
+    # RELATORIO
+    # ------------------------------------------------------------------
+    async def relatorio(self):
+        if time.time() - self.last_summary < 300:
             return
+        self.last_summary = time.time()
+        modo = "TESTNET" if not Config.OPERA_CONTA_REAL else "REAL"
+        await TelegramLogger.send(
+            f"📊 RAIO-X [{modo}]\n"
+            f"Saldo: ${self.saldo:.2f} | PnL dia: ${self.pnl_dia:+.2f}\n"
+            f"Posicoes: {len(self.posicoes)}/{Config.MAX_OPEN_TRADES} | "
+            f"Perdas seg: {self.perdas_seg}\n"
+            f"Kill-switch: {'🚨 ON' if self.kill_switch else 'ok'}"
+        )
 
-        self.last_summary_time = now
+    # ------------------------------------------------------------------
+    # LOOP
+    # ------------------------------------------------------------------
+    async def loop(self):
+        logging.info(
+            f"GERENCIADOR ONLINE | 1 posicao | risco {Config.MAX_POSITION_RISK:.0%} "
+            f"(${(Config.BANCA_INICIAL_USD * Config.MAX_POSITION_RISK):.2f})/trade | "
+            f"time-stop {Config.TIME_STOP_MINUTES}min"
+        )
+        try:
+            while True:
+                try:
+                    self._reset_dia()
+                    await self.executar_novas_entradas()
+                    await self.sincronizar_posicoes()
+                    await self.gerenciar_posicoes()
+                    await self.relatorio()
+                except Exception as e:
+                    logging.error(f"Erro no loop: {e}")
+                await asyncio.sleep(2.0)
+        finally:
+            await self.oraculo.fechar_conexoes()
 
-        # Para não sobrecarregar, consolidaremos num relatório só.
-        modo_texto = "CONTA REAL ⚠️" if getattr(Config, 'OPERA_CONTA_REAL', False) else "SIMULAÇÃO 🔬"
-        await TelegramLogger.send(f"⏱️ <b>RAIO-X GERENCIAL (10 min)</b> [{modo_texto}]\n💰 Saldo Atual: ${self.saldo_atual:.2f}")
-
-    async def loop_agente_autonomo(self):
-        logging.info("🧠 GERENCIADOR HÍBRIDO ONLINE — Direcional & Arbitragem")
-        logging.info(f"💰 Saldo da Banca Inicializado: ${self.saldo_atual:.2f}")
-        
-        await self.setup_db_arbitragem()
-        
-        while True:
-            try:
-                # Trilha Direcional
-                await self.executar_novas_entradas()
-                await self.sincronizar_posicoes_abertas()
-                await self.gerenciar_posicoes_2r()
-
-                # Trilha Arbitragem Neutra
-                await self.executar_novas_entradas_arbitragem()
-                await self.gerenciar_posicoes_arbitragem()
-
-                await self.relatorio_periodico()
-            except Exception as e:
-                logging.error(f"Erro crítico no loop híbrido do gerenciador: {e}")
-            finally:
-                await asyncio.sleep(3)
 
 if __name__ == "__main__":
     try:
-        gerenciador = GerenciadorRiscoAutonomo()
-        asyncio.run(gerenciador.loop_agente_autonomo())
+        asyncio.run(GerenciadorRisco().loop())
     except KeyboardInterrupt:
-        logging.info("🛑 Gerenciador Híbrido desligado pelo operador.")
+        logging.info("Gerenciador desligado.")
